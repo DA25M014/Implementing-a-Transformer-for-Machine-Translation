@@ -597,10 +597,54 @@ class Transformer(nn.Module):
 
     def infer(self, src_sentence: str) -> str:
         """
-        Translate a single German sentence to English.
+        Translate a single German sentence to English via greedy decoding.
 
-        Implementation wired up in Step 20 (greedy decoding + detokenization).
+        End-to-end pipeline:
+          1. spaCy-tokenize the input German string.
+          2. Wrap in <sos> ... <eos> and convert to ids via src_vocab.
+          3. Build the src padding mask (trivially all-False for one sentence).
+          4. Call train.greedy_decode for autoregressive generation.
+          5. Strip specials and join tokens with spaces.
+
+        Returns the English translation as a plain string.
         """
-        raise NotImplementedError(
-            "infer() implementation pending Step 20 (greedy decoder + detokenization)."
+        if self.src_vocab is None or self.tgt_vocab is None:
+            raise RuntimeError(
+                "Vocab not loaded. Ensure artifacts/vocab_de.pt and vocab_en.pt exist."
+            )
+        if self.src_tokenizer is None:
+            raise RuntimeError(
+                "spaCy tokenizer not loaded. Check de_core_news_sm installation."
+            )
+
+        # Local import to avoid circular dependency (train.py imports model.py).
+        from train import greedy_decode
+
+        device = next(self.parameters()).device
+
+        # Tokenize and convert to ids (with <sos>/<eos>).
+        de_tokens = self.src_tokenizer(src_sentence)[: self.max_len - 2]
+        src_ids   = self.src_vocab.encode(de_tokens, add_specials=True)
+        src       = torch.tensor([src_ids], dtype=torch.long, device=device)
+
+        # Source padding mask: no padding in a single-sentence batch.
+        src_mask = (src == self.tgt_vocab.PAD_IDX).unsqueeze(1).unsqueeze(2)
+
+        # Greedy decode -- cap output length proportional to source length
+        # plus a small additive slack (NMT heuristic; prevents runaway generation).
+        out_max_len = min(self.max_len, len(src_ids) + 10)
+
+        ys = greedy_decode(
+            model=self,
+            src=src,
+            src_mask=src_mask,
+            max_len=out_max_len,
+            start_symbol=self.tgt_vocab.SOS_IDX,
+            end_symbol=self.tgt_vocab.EOS_IDX,
+            device=str(device),
         )
+
+        # Detokenize: strip specials, join with spaces.
+        out_ids = ys[0].tolist()
+        en_tokens = self.tgt_vocab.decode(out_ids, strip_specials=True)
+        return " ".join(en_tokens)

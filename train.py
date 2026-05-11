@@ -105,25 +105,42 @@ def greedy_decode(
     device: str = "cpu",
 ) -> torch.Tensor:
     """
-    Generate a translation token-by-token using greedy decoding.
+    Token-by-token greedy decoding from a trained Transformer.
+
+    The encoder runs ONCE outside the loop; the decoder is called on
+    a growing prefix at each step. This is O(n^2) total -- fine for
+    Multi30k whose sentences average ~13 tokens.
 
     Args:
-        model        : Trained Transformer.
-        src          : Source token indices, shape [1, src_len].
-        src_mask     : shape [1, 1, 1, src_len].
-        max_len      : Maximum number of tokens to generate.
-        start_symbol : Vocabulary index of <sos>.
-        end_symbol   : Vocabulary index of <eos>.
-        device       : 'cpu' or 'cuda'.
+        model        : trained Transformer (caller is responsible for .eval())
+        src          : [1, src_len] source token ids
+        src_mask     : [1, 1, 1, src_len]
+        max_len      : hard cap on generated length (including <sos>)
+        start_symbol : <sos> id
+        end_symbol   : <eos> id
+        device       : torch device string
 
     Returns:
-        ys : Generated token indices, shape [1, out_len].
-             Includes start_symbol; stops at (and includes) end_symbol
-             or when max_len is reached.
-
+        [1, out_len] including start_symbol and -- if reached -- end_symbol.
     """
-    # TODO: Task 3.3 — implement token-by-token greedy decoding
-    raise NotImplementedError
+    model = model.to(device)
+    src      = src.to(device)
+    src_mask = src_mask.to(device)
+
+    memory = model.encode(src, src_mask)
+
+    ys = torch.tensor([[start_symbol]], dtype=torch.long, device=device)
+
+    for _ in range(max_len - 1):
+        tgt_mask = make_tgt_mask(ys, pad_idx=1).to(device)
+        logits   = model.decode(memory, src_mask, ys, tgt_mask)
+        next_logits = logits[:, -1, :]                       # [1, V]
+        next_id     = next_logits.argmax(dim=-1, keepdim=True)  # [1, 1]
+        ys = torch.cat([ys, next_id], dim=1)
+        if next_id.item() == end_symbol:
+            break
+
+    return ys
 
 
 # ══════════════════════════════════════════════════════════════════════
