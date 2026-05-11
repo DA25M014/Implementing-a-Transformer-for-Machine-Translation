@@ -247,33 +247,24 @@ class PositionalEncoding(nn.Module):
 
 class PositionwiseFeedForward(nn.Module):
     """
-    Position-wise Feed-Forward Network, §3.3:
+    Position-wise feed-forward network (Vaswani et al. 2017, Section 3.3).
 
-        FFN(x) = max(0, x·W₁ + b₁)·W₂ + b₂
+        FFN(x) = max(0, x W1 + b1) W2 + b2
 
-    Args:
-        d_model (int)  : Input / output dimensionality (e.g. 512).
-        d_ff    (int)  : Inner-layer dimensionality (e.g. 2048).
-        dropout (float): Dropout applied between the two linears.
+    Two-layer MLP applied independently and identically to each position.
+    Dropout is applied after the ReLU activation (paper Section 5.4).
     """
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
-        # TODO: Task 2.3 — define:
-        #   self.linear1 = nn.Linear(d_model, d_ff)
-        #   self.linear2 = nn.Linear(d_ff, d_model)
-        #   self.dropout = nn.Dropout(p=dropout)
-        raise NotImplementedError
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.act     = nn.ReLU()
+        self.drop    = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x : shape [batch, seq_len, d_model]
-        Returns:
-              shape [batch, seq_len, d_model]
-        
-        """
-        raise NotImplementedError
+        # [B, L, d_model] -> [B, L, d_ff] -> [B, L, d_model]
+        return self.linear2(self.drop(self.act(self.linear1(x))))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -282,32 +273,37 @@ class PositionwiseFeedForward(nn.Module):
 
 class EncoderLayer(nn.Module):
     """
-    Single Transformer encoder sub-layer:
-        x → [Self-Attention → Add & Norm] → [FFN → Add & Norm]
+    One encoder block with PRE-LayerNorm ordering:
 
-    Args:
-        d_model   (int)  : Model dimensionality.
-        num_heads (int)  : Number of attention heads.
-        d_ff      (int)  : FFN inner dimensionality.
-        dropout   (float): Dropout probability.
+        x = x + drop(self_attn(norm1(x)))
+        x = x + drop(ffn(norm2(x)))
+
+    Pre-LN is chosen over Post-LN because:
+      1. It is stable without aggressive warmup tuning -- gradients of
+         attention weights stay well-conditioned from the very first step.
+      2. It removes the need to scale residual paths by 1/sqrt(N) for
+         deep stacks (Xiong et al. 2020, "On Layer Normalization in
+         the Transformer Architecture").
+      3. It is the current standard in production transformers (GPT,
+         LLaMA, T5-1.1, etc.).
     """
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
-        # TODO:instantiate:
-        raise NotImplementedError
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout=dropout)
+        self.ffn       = PositionwiseFeedForward(d_model, d_ff, dropout=dropout)
+        self.norm1     = nn.LayerNorm(d_model)
+        self.norm2     = nn.LayerNorm(d_model)
+        self.drop      = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x        : shape [batch, src_len, d_model]
-            src_mask : shape [batch, 1, 1, src_len]
+        # Sub-layer 1: self-attention with pre-norm residual
+        normed = self.norm1(x)
+        x = x + self.drop(self.self_attn(normed, normed, normed, mask=src_mask))
 
-        Returns:
-            shape [batch, src_len, d_model]
-
-        """
-        raise NotImplementedError
+        # Sub-layer 2: feed-forward with pre-norm residual
+        x = x + self.drop(self.ffn(self.norm2(x)))
+        return x
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -316,22 +312,24 @@ class EncoderLayer(nn.Module):
 
 class DecoderLayer(nn.Module):
     """
-    Single Transformer decoder sub-layer:
-        x → [Masked Self-Attn → Add & Norm]
-          → [Cross-Attn(memory) → Add & Norm]
-          → [FFN → Add & Norm]
+    One decoder block with PRE-LayerNorm ordering:
 
-    Args:
-        d_model   (int)  : Model dimensionality.
-        num_heads (int)  : Number of attention heads.
-        d_ff      (int)  : FFN inner dimensionality.
-        dropout   (float): Dropout probability.
+        x = x + drop(masked_self_attn(norm1(x)))
+        x = x + drop(cross_attn(norm2(x), memory, memory))
+        x = x + drop(ffn(norm3(x)))
+
+    See EncoderLayer docstring for the Pre-LN justification.
     """
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
-        # TODO: instantiate:
-        raise NotImplementedError
+        self.self_attn  = MultiHeadAttention(d_model, num_heads, dropout=dropout)
+        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout=dropout)
+        self.ffn        = PositionwiseFeedForward(d_model, d_ff, dropout=dropout)
+        self.norm1      = nn.LayerNorm(d_model)
+        self.norm2      = nn.LayerNorm(d_model)
+        self.norm3      = nn.LayerNorm(d_model)
+        self.drop       = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -340,17 +338,17 @@ class DecoderLayer(nn.Module):
         src_mask: torch.Tensor,
         tgt_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            x        : shape [batch, tgt_len, d_model]
-            memory   : Encoder output, shape [batch, src_len, d_model]
-            src_mask : shape [batch, 1, 1, src_len]
-            tgt_mask : shape [batch, 1, tgt_len, tgt_len]
+        # Sub-layer 1: masked self-attention
+        normed = self.norm1(x)
+        x = x + self.drop(self.self_attn(normed, normed, normed, mask=tgt_mask))
 
-        Returns:
-            shape [batch, tgt_len, d_model]
-        """
-        raise NotImplementedError
+        # Sub-layer 2: cross-attention to encoder memory
+        normed = self.norm2(x)
+        x = x + self.drop(self.cross_attn(normed, memory, memory, mask=src_mask))
+
+        # Sub-layer 3: feed-forward
+        x = x + self.drop(self.ffn(self.norm3(x)))
+        return x
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -358,29 +356,54 @@ class DecoderLayer(nn.Module):
 # ══════════════════════════════════════════════════════════════════════
 
 class Encoder(nn.Module):
-    """Stack of N identical EncoderLayer modules with final LayerNorm."""
+    """
+    Stack of N identical EncoderLayer modules with a final LayerNorm.
+
+    The final norm is necessary under Pre-LN: without it, the very last
+    residual addition leaves activations un-normalized before they reach
+    the decoder's cross-attention.
+
+    Layers are constructed fresh (no copy.deepcopy) so each has its own
+    initialised parameters and there is no shared-state confusion.
+    """
 
     def __init__(self, layer: EncoderLayer, N: int) -> None:
         super().__init__()
-        raise NotImplementedError
+        # Pull config off the prototype layer; clone by re-construction.
+        d_model   = layer.norm1.normalized_shape[0]
+        num_heads = layer.self_attn.num_heads
+        d_ff      = layer.ffn.linear1.out_features
+        dropout   = layer.drop.p
+
+        self.layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, d_ff, dropout=dropout)
+            for _ in range(N)
+        ])
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x    : shape [batch, src_len, d_model]
-            mask : shape [batch, 1, 1, src_len]
-        Returns:
-            shape [batch, src_len, d_model]
-        """
-        raise NotImplementedError
-
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
 
 class Decoder(nn.Module):
-    """Stack of N identical DecoderLayer modules with final LayerNorm."""
+    """
+    Stack of N identical DecoderLayer modules with a final LayerNorm.
+    Same Pre-LN motivation as Encoder.
+    """
 
     def __init__(self, layer: DecoderLayer, N: int) -> None:
         super().__init__()
-        raise NotImplementedError
+        d_model   = layer.norm1.normalized_shape[0]
+        num_heads = layer.self_attn.num_heads
+        d_ff      = layer.ffn.linear1.out_features
+        dropout   = layer.drop.p
+
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, d_ff, dropout=dropout)
+            for _ in range(N)
+        ])
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(
         self,
@@ -389,16 +412,9 @@ class Decoder(nn.Module):
         src_mask: torch.Tensor,
         tgt_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            x        : shape [batch, tgt_len, d_model]
-            memory   : shape [batch, src_len, d_model]
-            src_mask : shape [batch, 1, 1, src_len]
-            tgt_mask : shape [batch, 1, tgt_len, tgt_len]
-        Returns:
-            shape [batch, tgt_len, d_model]
-        """
-        raise NotImplementedError
+        for layer in self.layers:
+            x = layer(x, memory, src_mask, tgt_mask)
+        return self.norm(x)
 
 
 # ══════════════════════════════════════════════════════════════════════
