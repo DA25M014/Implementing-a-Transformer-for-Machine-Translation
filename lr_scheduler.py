@@ -18,17 +18,22 @@ from torch.optim.lr_scheduler import LRScheduler
 
 class NoamScheduler(LRScheduler):
     """
-    Noam learning rate scheduler as described in "Attention Is All You Need".
+    Noam learning rate schedule from "Attention Is All You Need".
 
-    Applies a warm-up phase where LR increases linearly, followed by
-    a decay phase where LR decreases proportional to the inverse square
-    root of the step number.
+    Two arms:
+        arm_warmup = step * warmup_steps^(-1.5)   (linear warmup)
+        arm_decay  = step^(-0.5)                  (inverse-sqrt decay)
 
-    Args:
-        optimizer (torch.optim.Optimizer): Wrapped optimizer.
-        d_model          (int)  : Model dimensionality (embedding size).
-        warmup_steps     (int)  : Number of warm-up steps before decay begins.
-        last_epoch       (int)  : The index of the last epoch. Default: -1.
+    The effective scale at step t is:
+        scale(t) = d_model^(-0.5) * min(arm_decay, arm_warmup)
+
+    The crossover happens exactly at step == warmup_steps, where both
+    arms equal warmup_steps^(-0.5). The peak LR is therefore:
+        lr_peak = d_model^(-0.5) * warmup_steps^(-0.5)
+
+    Because this scheduler multiplies each param group's base_lr by
+    this scale, initialize your optimizer with lr=1.0 so the schedule
+    produces raw Noam values (not a scaled-down version).
     """
 
     def __init__(
@@ -38,41 +43,33 @@ class NoamScheduler(LRScheduler):
         warmup_steps: int,
         last_epoch: int = -1,
     ) -> None:
-        # TODO: Store d_model and warmup_steps as instance attributes
-        # TODO: Call the parent __init__
-        raise NotImplementedError
+        if d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {d_model}")
+        if warmup_steps <= 0:
+            raise ValueError(f"warmup_steps must be positive, got {warmup_steps}")
 
-    # ------------------------------------------------------------------
+        self.d_model      = d_model
+        self.warmup_steps = warmup_steps
+
+        # Precompute the model-dim factor; reused on every step.
+        self._dim_factor = d_model ** -0.5
+
+        super().__init__(optimizer, last_epoch=last_epoch)
+
     def _get_lr_scale(self) -> float:
-        """
-        Compute the Noam scaling factor for the current step.
+        step = self.last_epoch + 1                          # avoid step == 0
 
-        Returns:
-            float: The scalar multiplier applied to the base learning rate.
+        arm_decay  = step ** -0.5
+        arm_warmup = step * (self.warmup_steps ** -1.5)
 
-        Hint:
-            step = self.last_epoch + 1            # avoid step=0
-            scale = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5))
-        """
-        # TODO: Implement and return the Noam scale factor
-        raise NotImplementedError
+        return self._dim_factor * min(arm_decay, arm_warmup)
 
-    # ------------------------------------------------------------------
     def get_lr(self) -> list[float]:
-        """
-        Compute learning rates for every param group.
+        if not self.base_lrs:
+            return []
+        scale = self._get_lr_scale()
+        return [base * scale for base in self.base_lrs]
 
-        Called internally by PyTorch's scheduler machinery each step.
-
-        Returns:
-            list[float]: New learning rate for each param group in the optimizer.
-
-        Hint:
-            Multiply each group's `base_lr` by the value from `_get_lr_scale()`.
-            Access base learning rates via `self.base_lrs`.
-        """
-        # TODO: Return a list of scaled LRs, one per param group
-        raise NotImplementedError
 
 
 # ──────────────────────────────────────────────────────────────────────
