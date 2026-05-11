@@ -38,24 +38,34 @@ def scaled_dot_product_attention(
     mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute Scaled Dot-Product Attention.
+    Scaled dot-product attention.
 
-        Attention(Q, K, V) = softmax( Q·Kᵀ / √dₖ ) · V
+        Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
+
+    Boolean mask convention enforced by the skeleton:
+    True  -> position is masked out (gets -inf before softmax).
+    False -> attend normally.
 
     Args:
-        Q    : Query tensor,  shape (..., seq_q, d_k)
-        K    : Key tensor,    shape (..., seq_k, d_k)
-        V    : Value tensor,  shape (..., seq_k, d_v)
-        mask : Optional Boolean mask, shape broadcastable to
-               (..., seq_q, seq_k).
-               Positions where mask is True are MASKED OUT
-               (set to -inf before softmax).
+        Q    : (..., seq_q, d_k)
+        K    : (..., seq_k, d_k)
+        V    : (..., seq_k, d_v)
+        mask : broadcastable to (..., seq_q, seq_k), bool
 
     Returns:
-        output : Attended output,   shape (..., seq_q, d_v)
-        attn_w : Attention weights, shape (..., seq_q, seq_k)
+        output  : (..., seq_q, d_v)
+        attn_w  : (..., seq_q, seq_k)  post-softmax weights
     """
-    raise NotImplementedError
+    d_k = Q.size(-1)
+    scale = d_k ** -0.5
+
+    scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
+    if mask is not None:
+        scores = scores.masked_fill(mask, float("-inf"))
+
+    alpha = torch.softmax(scores, dim=-1)
+    output = torch.matmul(alpha, V)
+    return output, alpha
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -69,18 +79,12 @@ def make_src_mask(
     pad_idx: int = 1,
 ) -> torch.Tensor:
     """
-    Build a padding mask for the encoder (source sequence).
+    Encoder padding mask. True at <pad> positions, False elsewhere.
 
-    Args:
-        src     : Source token-index tensor, shape [batch, src_len]
-        pad_idx : Vocabulary index of the <pad> token (default 1)
-
-    Returns:
-        Boolean mask, shape [batch, 1, 1, src_len]
-        True  → position is a PAD token (will be masked out)
-        False → real token
+    Shape: [B, 1, 1, src_len] broadcasts over heads and queries
+    so one mask covers all (head, query) attention rows.
     """
-    raise NotImplementedError
+    return (src == pad_idx).unsqueeze(1).unsqueeze(2)
 
 
 def make_tgt_mask(
@@ -88,17 +92,19 @@ def make_tgt_mask(
     pad_idx: int = 1,
 ) -> torch.Tensor:
     """
-    Build a combined padding + causal (look-ahead) mask for the decoder.
+    Decoder mask = padding mask OR causal (look-ahead) mask.
 
-    Args:
-        tgt     : Target token-index tensor, shape [batch, tgt_len]
-        pad_idx : Vocabulary index of the <pad> token (default 1)
-
-    Returns:
-        Boolean mask, shape [batch, 1, tgt_len, tgt_len]
-        True → position is masked out (PAD or future token)
+    True at positions to mask out (PAD or future tokens).
+    Shape: [B, 1, tgt_len, tgt_len].
     """
-    raise NotImplementedError
+    B, L = tgt.shape
+
+    pad_mask = (tgt == pad_idx).view(B, 1, 1, L)
+
+    causal = torch.ones(L, L, dtype=torch.bool, device=tgt.device).triu(1)
+    causal = causal.view(1, 1, L, L)
+
+    return pad_mask | causal
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -107,17 +113,20 @@ def make_tgt_mask(
 
 class MultiHeadAttention(nn.Module):
     """
-    Multi-Head Attention as in "Attention Is All You Need", §3.2.2.
+    Multi-Head Attention (Vaswani et al. 2017, Section 3.2.2).
 
-        MultiHead(Q,K,V) = Concat(head_1,...,head_h) · W_O
-        head_i = Attention(Q·W_Qi, K·W_Ki, V·W_Vi)
+        MultiHead(Q, K, V) = Concat(head_1, ..., head_h) @ W_O
+        head_i              = Attention(Q W_Q^i, K W_K^i, V W_V^i)
 
-    You are NOT allowed to use torch.nn.MultiheadAttention.
+    Implementation notes:
+      - Q, K, V are projected by a SINGLE fused linear of width 3*d_model,
+        then chunked along the last dim. Fewer parameters in the optimizer
+        state and fewer kernel launches than three separate linears.
+      - Output projection is named ``out_proj`` so it can be tied to the
+        decoder embedding weight externally if desired.
+      - The 1/sqrt(d_k) scale is delegated to scaled_dot_product_attention.
 
-    Args:
-        d_model   (int)  : Total model dimensionality. Must be divisible by num_heads.
-        num_heads (int)  : Number of parallel attention heads h.
-        dropout   (float): Dropout probability applied to attention weights.
+    nn.MultiheadAttention is NOT used.
     """
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1) -> None:
@@ -126,9 +135,20 @@ class MultiHeadAttention(nn.Module):
 
         self.d_model   = d_model
         self.num_heads = num_heads
-        self.d_k       = d_model // num_heads   # depth per head
-        raise NotImplementedError
-    
+        self.d_k       = d_model // num_heads
+
+        self.qkv      = nn.Linear(d_model, 3 * d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+        self.drop     = nn.Dropout(dropout)
+
+    def _split_heads(self, t: torch.Tensor) -> torch.Tensor:
+        B, L, _ = t.shape
+        return t.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+
+    def _merge_heads(self, t: torch.Tensor) -> torch.Tensor:
+        B, h, L, d_k = t.shape
+        return t.transpose(1, 2).contiguous().view(B, L, h * d_k)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -137,19 +157,39 @@ class MultiHeadAttention(nn.Module):
         mask:  Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
+        Self-attention is the case query is key is value.
+        Cross-attention passes encoder memory as key and value.
+
         Args:
-            query : shape [batch, seq_q, d_model]
-            key   : shape [batch, seq_k, d_model]
-            value : shape [batch, seq_k, d_model]
-            mask  : Optional BoolTensor broadcastable to
-                    [batch, num_heads, seq_q, seq_k]
-                    True → masked out (attend nowhere)
+            query : [B, seq_q, d_model]
+            key   : [B, seq_k, d_model]
+            value : [B, seq_k, d_model]
+            mask  : broadcastable to [B, num_heads, seq_q, seq_k], bool,
+                    True = masked out.
 
         Returns:
-            output : shape [batch, seq_q, d_model]
-
+            [B, seq_q, d_model]
         """
-        raise NotImplementedError
+        if query is key and key is value:
+            qkv = self.qkv(query)
+            q, k, v = qkv.chunk(3, dim=-1)
+        else:
+            W = self.qkv.weight
+            b = self.qkv.bias
+            d = self.d_model
+            q = torch.nn.functional.linear(query, W[:d],    b[:d])
+            k = torch.nn.functional.linear(key,   W[d:2*d], b[d:2*d])
+            v = torch.nn.functional.linear(value, W[2*d:],  b[2*d:])
+
+        q = self._split_heads(q)
+        k = self._split_heads(k)
+        v = self._split_heads(v)
+
+        attended, _ = scaled_dot_product_attention(q, k, v, mask=mask)
+        attended = self.drop(attended)
+
+        merged = self._merge_heads(attended)
+        return self.out_proj(merged)
 
 
 # ══════════════════════════════════════════════════════════════════════
