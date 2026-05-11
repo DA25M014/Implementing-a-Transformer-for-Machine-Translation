@@ -158,29 +158,47 @@ class MultiHeadAttention(nn.Module):
 
 class PositionalEncoding(nn.Module):
     """
-    Sinusoidal Positional Encoding as in "Attention Is All You Need", §3.5.
+    Sinusoidal positional encoding (Vaswani et al. 2017, Section 3.5).
 
-    Args:
-        d_model  (int)  : Embedding dimensionality.
-        dropout  (float): Dropout applied after adding encodings.
-        max_len  (int)  : Maximum sequence length to pre-compute (default 5000).
+    Even dims carry sine, odd dims carry cosine, with geometrically
+    spaced frequencies running from 1 (period 2*pi) down to 1/10000
+    (period 2*pi*10000). The table is precomputed once at init and
+    stored as a non-persistent buffer -- it is deterministic, so there
+    is no reason to bloat checkpoints with ~10 MB of constants.
     """
 
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
         super().__init__()
-        raise NotImplementedError
+        assert d_model % 2 == 0, "d_model must be even for sinusoidal PE"
+
+        self.drop = nn.Dropout(dropout)
+
+        table = self._build_sinusoid_table(max_len, d_model)
+        self.register_buffer("pe", table, persistent=False)
+
+    @staticmethod
+    def _build_sinusoid_table(max_len: int, d_model: int) -> torch.Tensor:
+        # Frequencies: omega_i = 10000^(-2i/d_model) for i = 0, 1, ..., d/2 - 1
+        half_dim = d_model // 2
+        i = torch.arange(half_dim, dtype=torch.float32)
+        omega = torch.pow(10000.0, -2.0 * i / d_model)             # [d/2]
+
+        # Positions: 0, 1, ..., max_len - 1
+        pos = torch.arange(max_len, dtype=torch.float32)           # [L]
+
+        # Outer product gives angle[p, i] = p * omega_i
+        angles = torch.outer(pos, omega)                           # [L, d/2]
+
+        # Interleave even=sin, odd=cos via stack-then-flatten.
+        table = torch.stack([angles.sin(), angles.cos()], dim=-1)  # [L, d/2, 2]
+        table = table.flatten(start_dim=-2)                        # [L, d_model]
+
+        return table.unsqueeze(0)                                  # [1, L, d_model]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x : Input embeddings, shape [batch, seq_len, d_model]
-
-        Returns:
-            Tensor of same shape [batch, seq_len, d_model]
-            = x  +  PE[:, :seq_len, :]  
-
-        """
-        raise NotImplementedError
+        # x: [B, L, d_model] -- PE broadcasts over the batch dim.
+        L = x.size(1)
+        return self.drop(x + self.pe[:, :L])
 
 
 # ══════════════════════════════════════════════════════════════════════
