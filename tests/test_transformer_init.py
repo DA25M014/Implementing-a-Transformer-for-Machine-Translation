@@ -51,14 +51,12 @@ def test_no_gdown_call_without_id():
     return "no gdown invocation when CHECKPOINT_GDRIVE_ID is None"
 
 
-def test_infer_raises_clear_error_pre_step20():
-    model = Transformer()
-    try:
-        model.infer("Ein Test.")
-    except NotImplementedError as e:
-        assert "Step 20" in str(e) or "pending" in str(e).lower()
-        return "infer() raises a clear placeholder error"
-    raise AssertionError("infer() should raise NotImplementedError until Step 20")
+def test_infer_returns_string():
+    """After Step 20, infer() is wired end-to-end; should return a string."""
+    model = Transformer().eval()
+    out = model.infer("Ein Test.")
+    assert isinstance(out, str), f"expected str, got {type(out).__name__}"
+    return f"infer() returns string: {out!r}"
 
 
 def test_param_count_with_real_defaults():
@@ -75,7 +73,7 @@ if __name__ == "__main__":
         test_defaults_match_real_vocab_sizes,
         test_eval_mode_and_to_device,
         test_no_gdown_call_without_id,
-        test_infer_raises_clear_error_pre_step20,
+        test_infer_returns_string,
         test_param_count_with_real_defaults,
     ]
     print(f"Running {len(tests)} Transformer __init__ tests\n" + "-" * 70)

@@ -1,98 +1,216 @@
 """
-train.py — Training Pipeline, Inference & Evaluation
-DA6401 Assignment 3: "Attention Is All You Need"
+train.py -- Training pipeline, evaluation, checkpointing.
 
-AUTOGRADER CONTRACT (DO NOT MODIFY SIGNATURES):
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  greedy_decode(model, src, src_mask, max_len, start_symbol)         │
-  │      → torch.Tensor  shape [1, out_len]  (token indices)            │
-  │                                                                     │
-  │  evaluate_bleu(model, test_dataloader, tgt_vocab, device)           │
-  │      → float  (corpus-level BLEU score, 0–100)                      │
-  │                                                                     │
-  │  save_checkpoint(model, optimizer, scheduler, epoch, path) → None   │
-  │  load_checkpoint(path, model, optimizer, scheduler)        → int    │
-  └─────────────────────────────────────────────────────────────────────┘
+Implements the autograder contract:
+    greedy_decode(model, src, src_mask, max_len, start_symbol, end_symbol, device)
+    evaluate_bleu(model, test_dataloader, tgt_vocab, device)
+    save_checkpoint(model, optimizer, scheduler, epoch, path)
+    load_checkpoint(path, model, optimizer, scheduler) -> int
+
+Plus the orchestration:
+    LabelSmoothingLoss   -- KL-divergence form, eps/(V-1) mass on wrong classes.
+    run_epoch            -- one train or eval epoch with W&B logging hooks.
+    run_training_experiment(config) -- single entrypoint for all 5 ablation runs.
 """
+
+import math
+import os
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from typing import Optional
 
 from model import Transformer, make_src_mask, make_tgt_mask
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  LABEL SMOOTHING LOSS  
+#  LABEL SMOOTHING LOSS
 # ══════════════════════════════════════════════════════════════════════
 
 class LabelSmoothingLoss(nn.Module):
     """
-    Label smoothing as in "Attention Is All You Need"
+    Label smoothing via explicit smoothed-target KL divergence.
 
-    Smoothed target distribution:
-        y_smooth = (1 - eps) * one_hot(y) + eps / (vocab_size - 1)
+    Smoothed distribution per token:
+        true_class       -> (1 - smoothing)
+        any other class  -> smoothing / (V - 2)        (V - 2 because pad also excluded)
+        pad class        -> 0
 
-    Args:
-        vocab_size (int)  : Number of output classes.
-        pad_idx    (int)  : Index of <pad> token — receives 0 probability.
-        smoothing  (float): Smoothing factor ε (default 0.1).
+    Note: the skeleton docstring states eps/(V-1), but pad is also
+    excluded from the smoothed mass, so the practical denominator is
+    V-2. The difference is negligible for V > 1000.
+
+    Loss is the KL divergence sum over the vocabulary axis, averaged
+    over non-pad target tokens.
     """
 
-    def __init__(self, vocab_size: int, pad_idx: int, smoothing: float = 0.1) -> None:
+    def __init__(self, vocab_size: int, pad_idx: int = 1, smoothing: float = 0.1) -> None:
         super().__init__()
-        raise NotImplementedError
+        assert 0.0 <= smoothing < 1.0
+        self.vocab_size = vocab_size
+        self.pad_idx    = pad_idx
+        self.smoothing  = smoothing
+        self.criterion  = nn.KLDivLoss(reduction="sum")
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            logits : shape [batch * tgt_len, vocab_size]  (raw model output)
-            target : shape [batch * tgt_len]              (gold token indices)
+            logits : [N, V] raw logits (typically logits.reshape(-1, V))
+            target : [N]    gold ids
 
         Returns:
-            Scalar loss value.
+            scalar loss, averaged over non-pad tokens
         """
-        # TODO: Task 3.1
-        raise NotImplementedError
+        assert logits.size(1) == self.vocab_size,             f"logits dim {logits.size(1)} != vocab {self.vocab_size}"
+
+        # Build the smoothed target distribution.
+        with torch.no_grad():
+            smooth_val = self.smoothing / (self.vocab_size - 2)
+            true_dist = torch.full_like(logits, smooth_val)
+            true_dist[:, self.pad_idx] = 0.0
+            true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+            # Rows where the target IS pad get all-zero distribution (masked out).
+            pad_rows = (target == self.pad_idx)
+            true_dist[pad_rows] = 0.0
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        loss_sum  = self.criterion(log_probs, true_dist)
+
+        n_nonpad = (~pad_rows).sum().clamp(min=1)
+        return loss_sum / n_nonpad
 
 
 # ══════════════════════════════════════════════════════════════════════
-#   TRAINING LOOP  
+#  TRAINING / EVAL EPOCH
 # ══════════════════════════════════════════════════════════════════════
+
+def _qk_grad_norms(model: Transformer) -> tuple[float, float]:
+    """
+    Aggregate the Frobenius norms of all Q and K projection gradients
+    in the encoder + decoder self-attention layers.
+
+    Returns (q_norm, k_norm). Each is the L2 norm of the concatenated
+    grads from every layer. Used for the section 2.2 ablation analysis.
+    """
+    q_grads, k_grads = [], []
+    for module_path, module in model.named_modules():
+        if not module_path.endswith("self_attn"):
+            continue
+        if module.qkv.weight.grad is None:
+            continue
+        d = module.d_model
+        full_grad = module.qkv.weight.grad
+        q_grads.append(full_grad[:d].flatten())
+        k_grads.append(full_grad[d:2*d].flatten())
+
+    if not q_grads:
+        return 0.0, 0.0
+
+    q_norm = torch.cat(q_grads).norm().item()
+    k_norm = torch.cat(k_grads).norm().item()
+    return q_norm, k_norm
+
+
+def _prediction_confidence(logits: torch.Tensor, target: torch.Tensor, pad_idx: int = 1) -> float:
+    """
+    Mean softmax probability assigned to the correct token, averaged over
+    non-pad positions. Used for the section 2.5 label-smoothing analysis.
+    """
+    probs = F.softmax(logits, dim=-1)
+    correct_probs = probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    mask = (target != pad_idx)
+    if mask.sum().item() == 0:
+        return 0.0
+    return (correct_probs * mask).sum().item() / mask.sum().item()
+
 
 def run_epoch(
     data_iter,
     model: Transformer,
     loss_fn: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
+    optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler=None,
     epoch_num: int = 0,
     is_train: bool = True,
     device: str = "cpu",
-) -> float:
+    pad_idx: int = 1,
+    log_every: int = 50,
+    wandb_run=None,
+    grad_clip: float = 1.0,
+) -> dict[str, float]:
     """
     Run one epoch of training or evaluation.
 
-    Args:
-        data_iter  : DataLoader yielding (src, tgt) batches of token indices.
-        model      : Transformer instance.
-        loss_fn    : LabelSmoothingLoss (or any nn.Module loss).
-        optimizer  : Optimizer (None during eval).
-        scheduler  : NoamScheduler instance (None during eval).
-        epoch_num  : Current epoch index (for logging).
-        is_train   : If True, perform backward pass and scheduler step.
-        device     : 'cpu' or 'cuda'.
-
-    Returns:
-        avg_loss : Average loss over the epoch (float).
-
+    Returns a dict with: 'loss', 'perplexity', 'accuracy'.
+    On train epochs, also logs per-step metrics to W&B if wandb_run is provided.
     """
-    raise NotImplementedError
+    model.train(is_train)
+
+    total_loss, total_tokens, total_correct = 0.0, 0, 0
+    step_in_epoch = 0
+
+    for src, tgt in data_iter:
+        src = src.to(device)
+        tgt = tgt.to(device)
+
+        # Decoder input is the target shifted right; the loss target is shifted left.
+        tgt_in  = tgt[:, :-1]
+        tgt_out = tgt[:,  1:]
+
+        src_mask = make_src_mask(src, pad_idx=pad_idx).to(device)
+        tgt_mask = make_tgt_mask(tgt_in, pad_idx=pad_idx).to(device)
+
+        logits = model(src, tgt_in, src_mask, tgt_mask)
+        V      = logits.size(-1)
+        loss   = loss_fn(logits.reshape(-1, V), tgt_out.reshape(-1))
+
+        if is_train:
+            optimizer.zero_grad()
+            loss.backward()
+
+            q_norm, k_norm = _qk_grad_norms(model)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+
+            if wandb_run is not None and step_in_epoch % log_every == 0:
+                lr = optimizer.param_groups[0]["lr"]
+                conf = _prediction_confidence(logits.detach(), tgt_out, pad_idx=pad_idx)
+                wandb_run.log({
+                    "train/loss":            loss.item(),
+                    "train/step_lr":         lr,
+                    "train/grad_norm_Q":     q_norm,
+                    "train/grad_norm_K":     k_norm,
+                    "train/pred_confidence": conf,
+                    "epoch":                 epoch_num,
+                })
+
+        # Accumulate metrics over non-pad tokens.
+        with torch.no_grad():
+            mask = (tgt_out != pad_idx)
+            n_tok = mask.sum().item()
+            preds = logits.argmax(dim=-1)
+            n_correct = ((preds == tgt_out) & mask).sum().item()
+
+            total_loss    += loss.item() * n_tok
+            total_tokens  += n_tok
+            total_correct += n_correct
+
+        step_in_epoch += 1
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    return {
+        "loss":       avg_loss,
+        "perplexity": math.exp(min(avg_loss, 20)),     # cap to avoid overflow
+        "accuracy":   total_correct / max(total_tokens, 1),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
-#   GREEDY DECODING  
+#  GREEDY DECODING  (kept from Step 20)
 # ══════════════════════════════════════════════════════════════════════
 
 def greedy_decode(
@@ -106,22 +224,8 @@ def greedy_decode(
 ) -> torch.Tensor:
     """
     Token-by-token greedy decoding from a trained Transformer.
-
-    The encoder runs ONCE outside the loop; the decoder is called on
-    a growing prefix at each step. This is O(n^2) total -- fine for
-    Multi30k whose sentences average ~13 tokens.
-
-    Args:
-        model        : trained Transformer (caller is responsible for .eval())
-        src          : [1, src_len] source token ids
-        src_mask     : [1, 1, 1, src_len]
-        max_len      : hard cap on generated length (including <sos>)
-        start_symbol : <sos> id
-        end_symbol   : <eos> id
-        device       : torch device string
-
-    Returns:
-        [1, out_len] including start_symbol and -- if reached -- end_symbol.
+    Encoder runs once outside the loop; decoder is called per step
+    on a growing prefix.
     """
     model = model.to(device)
     src      = src.to(device)
@@ -134,8 +238,8 @@ def greedy_decode(
     for _ in range(max_len - 1):
         tgt_mask = make_tgt_mask(ys, pad_idx=1).to(device)
         logits   = model.decode(memory, src_mask, ys, tgt_mask)
-        next_logits = logits[:, -1, :]                       # [1, V]
-        next_id     = next_logits.argmax(dim=-1, keepdim=True)  # [1, 1]
+        next_logits = logits[:, -1, :]
+        next_id     = next_logits.argmax(dim=-1, keepdim=True)
         ys = torch.cat([ys, next_id], dim=1)
         if next_id.item() == end_symbol:
             break
@@ -144,7 +248,7 @@ def greedy_decode(
 
 
 # ══════════════════════════════════════════════════════════════════════
-#   BLEU EVALUATION  
+#  BLEU EVALUATION
 # ══════════════════════════════════════════════════════════════════════
 
 def evaluate_bleu(
@@ -155,28 +259,43 @@ def evaluate_bleu(
     max_len: int = 100,
 ) -> float:
     """
-    Evaluate translation quality with corpus-level BLEU score.
+    Corpus-level BLEU via sacrebleu, computed by greedy-decoding each
+    source sentence and comparing to the reference target sentence.
 
-    Args:
-        model           : Trained Transformer (in eval mode).
-        test_dataloader : DataLoader over the test split.
-                          Each batch yields (src, tgt) token-index tensors.
-        tgt_vocab       : Vocabulary object with idx_to_token mapping.
-                          Must support  tgt_vocab.itos[idx]  or
-                          tgt_vocab.lookup_token(idx).
-        device          : 'cpu' or 'cuda'.
-        max_len         : Max decode length per sentence.
-
-    Returns:
-        bleu_score : Corpus-level BLEU (float, range 0–100).
-
+    Returns: BLEU in [0, 100].
     """
-    # TODO: Task 3 — loop test set, decode, compute and return BLEU
-    raise NotImplementedError
+    import sacrebleu
+
+    model = model.to(device).eval()
+    hypotheses, references = [], []
+
+    with torch.no_grad():
+        for src, tgt in test_dataloader:
+            # Process one sentence at a time; greedy_decode expects batch=1.
+            for i in range(src.size(0)):
+                s = src[i:i+1].to(device)
+                t = tgt[i].tolist()
+
+                s_mask = make_src_mask(s, pad_idx=1).to(device)
+                y = greedy_decode(
+                    model=model, src=s, src_mask=s_mask,
+                    max_len=max_len,
+                    start_symbol=tgt_vocab.SOS_IDX,
+                    end_symbol=tgt_vocab.EOS_IDX,
+                    device=device,
+                )
+                hyp_tokens = tgt_vocab.decode(y[0].tolist(), strip_specials=True)
+                ref_tokens = tgt_vocab.decode(t,            strip_specials=True)
+
+                hypotheses.append(" ".join(hyp_tokens))
+                references.append(" ".join(ref_tokens))
+
+    bleu = sacrebleu.corpus_bleu(hypotheses, [references])
+    return float(bleu.score)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ❺  CHECKPOINT UTILITIES  (autograder loads your model from disk)
+#  CHECKPOINT UTILITIES
 # ══════════════════════════════════════════════════════════════════════
 
 def save_checkpoint(
@@ -187,30 +306,26 @@ def save_checkpoint(
     path: str = "checkpoint.pt",
 ) -> None:
     """
-    Save model + optimiser + scheduler state to disk.
-
-    The autograder will call load_checkpoint to restore your model.
-    Do NOT change the keys in the saved dict.
-
-    Args:
-        model     : Transformer instance.
-        optimizer : Optimizer instance.
-        scheduler : NoamScheduler instance.
-        epoch     : Current epoch number.
-        path      : File path to save to (default 'checkpoint.pt').
-
-    Saves a dict with keys:
-        'epoch', 'model_state_dict', 'optimizer_state_dict',
-        'scheduler_state_dict', 'model_config'
-
-    model_config must contain all kwargs needed to reconstruct
-    Transformer(**model_config), e.g.:
-        {'src_vocab_size': ..., 'tgt_vocab_size': ...,
-         'd_model': ..., 'N': ..., 'num_heads': ...,
-         'd_ff': ..., 'dropout': ...}
+    Save model + optimizer + scheduler state, plus the model_config dict
+    needed to reconstruct the architecture at load time.
     """
-    # TODO: implement using torch.save({...}, path)
-    raise NotImplementedError
+    model_config = {
+        "src_vocab_size": model.src_vocab_size,
+        "tgt_vocab_size": model.tgt_vocab_size,
+        "d_model":        model.d_model,
+        "N":              len(model.encoder.layers),
+        "num_heads":      model.encoder.layers[0].self_attn.num_heads,
+        "d_ff":           model.encoder.layers[0].ffn.linear1.out_features,
+        "dropout":        model.encoder.layers[0].drop.p,
+        "max_len":        model.max_len,
+    }
+    torch.save({
+        "epoch":                epoch,
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "model_config":         model_config,
+    }, path)
 
 
 def load_checkpoint(
@@ -221,50 +336,225 @@ def load_checkpoint(
 ) -> int:
     """
     Restore model (and optionally optimizer/scheduler) state from disk.
-
-    Args:
-        path      : Path to checkpoint file saved by save_checkpoint.
-        model     : Uninitialised Transformer with matching architecture.
-        optimizer : Optimizer to restore (pass None to skip).
-        scheduler : Scheduler to restore (pass None to skip).
-
-    Returns:
-        epoch : The epoch at which the checkpoint was saved (int).
-
+    Returns the saved epoch number.
     """
-    # TODO: implement restore logic
-    raise NotImplementedError
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(blob["model_state_dict"])
+    if optimizer is not None and blob.get("optimizer_state_dict") is not None:
+        optimizer.load_state_dict(blob["optimizer_state_dict"])
+    if scheduler is not None and blob.get("scheduler_state_dict") is not None:
+        scheduler.load_state_dict(blob["scheduler_state_dict"])
+    return int(blob.get("epoch", 0))
 
 
 # ══════════════════════════════════════════════════════════════════════
-#   EXPERIMENT ENTRY POINT
+#  EXPERIMENT ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════
 
-def run_training_experiment() -> None:
-    """
-    Set up and run the full training experiment.
+DEFAULT_CONFIG = {
+    # Architecture
+    "d_model":        512,
+    "N":              6,
+    "num_heads":      8,
+    "d_ff":           2048,
+    "dropout":        0.15,
+    "max_len":        128,
 
-    Steps:
-        1. Init W&B:   wandb.init(project="da6401-a3", config={...})
-        2. Build dataset / vocabs from dataset.py
-        3. Create DataLoaders for train / val splits
-        4. Instantiate Transformer with hyperparameters from config
-        5. Instantiate Adam optimizer (β1=0.9, β2=0.98, ε=1e-9)
-        6. Instantiate NoamScheduler(optimizer, d_model, warmup_steps=4000)
-        7. Instantiate LabelSmoothingLoss(vocab_size, pad_idx, smoothing=0.1)
-        8. Training loop:
-               for epoch in range(num_epochs):
-                   run_epoch(train_loader, model, loss_fn,
-                             optimizer, scheduler, epoch, is_train=True)
-                   run_epoch(val_loader, model, loss_fn,
-                             None, None, epoch, is_train=False)
-                   save_checkpoint(model, optimizer, scheduler, epoch)
-        9. Final BLEU on test set:
-               bleu = evaluate_bleu(model, test_loader, tgt_vocab)
-               wandb.log({'test_bleu': bleu})
+    # Optimization
+    "batch_size":     128,
+    "num_epochs":     25,
+    "warmup_steps":   4500,
+    "label_smooth":   0.1,
+    "betas":          (0.9, 0.98),
+    "eps":            1e-9,
+    "grad_clip":      1.0,
+    "seed":           25014,
+
+    # Ablation switches
+    "scheduler":      "noam",          # "noam" | "fixed"
+    "fixed_lr":       1e-4,            # used when scheduler == "fixed"
+    "use_scaling":    True,            # set False for sec 2.2 ablation
+    "pos_encoding":   "sinusoidal",    # "sinusoidal" | "learned" -- sec 2.4
+
+    # Run identity
+    "run_name":       "main",
+    "wandb_project":  "da6401-a3-transformer",
+    "wandb_group":    "baseline",
+    "wandb_tags":     ["control"],
+
+    # I/O
+    "artifacts_dir":  "artifacts",
+    "checkpoint":     "transformer_main.pt",
+}
+
+
+def run_training_experiment(config: dict | None = None) -> dict:
     """
-    # TODO: implement full experiment
-    raise NotImplementedError
+    Single entrypoint for all 5 ablation runs.
+
+    The 'config' dict is merged on top of DEFAULT_CONFIG, so a run can be
+    fully specified by overriding only the keys that differ from main.
+
+    Returns the final dict from the best epoch (by val BLEU).
+    """
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
+
+    torch.manual_seed(cfg["seed"])
+
+    # ── W&B (optional) ──────────────────────────────────────────────
+    wandb_run = None
+    try:
+        import wandb
+        wandb_run = wandb.init(
+            project=cfg["wandb_project"],
+            name=cfg["run_name"],
+            group=cfg["wandb_group"],
+            tags=cfg["wandb_tags"],
+            config=cfg,
+            job_type="train",
+        )
+    except Exception as e:
+        print(f"[wandb] disabled: {e}")
+
+    # ── Data ────────────────────────────────────────────────────────
+    from dataset import Multi30kDataset, Vocab, collate_batch
+
+    train_ds = Multi30kDataset(split="train",      artifacts_dir=cfg["artifacts_dir"],
+                               max_len=cfg["max_len"])
+    if train_ds.src_vocab is None:
+        train_ds.build_vocab(min_freq=2)
+    val_ds  = Multi30kDataset(split="validation", artifacts_dir=cfg["artifacts_dir"],
+                               max_len=cfg["max_len"])
+    test_ds = Multi30kDataset(split="test",       artifacts_dir=cfg["artifacts_dir"],
+                               max_len=cfg["max_len"])
+
+    src_vocab = train_ds.src_vocab
+    tgt_vocab = train_ds.tgt_vocab
+
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
+                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=2)
+    val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
+                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=2)
+    test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"], shuffle=False,
+                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=2)
+
+    # ── Model ───────────────────────────────────────────────────────
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+
+    model = Transformer(
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
+        d_model=cfg["d_model"], N=cfg["N"], num_heads=cfg["num_heads"],
+        d_ff=cfg["d_ff"], dropout=cfg["dropout"], max_len=cfg["max_len"],
+    ).to(device)
+
+    # Optional ablation: replace sinusoidal PE with learned embedding.
+    if cfg["pos_encoding"] == "learned":
+        model.pos_enc = _build_learned_pe(cfg["d_model"], cfg["max_len"], cfg["dropout"]).to(device)
+
+    # Optional ablation: disable 1/sqrt(d_k) scaling in attention.
+    if not cfg["use_scaling"]:
+        _disable_attention_scaling(model)
+
+    # ── Optimization ────────────────────────────────────────────────
+    base_lr = 1.0 if cfg["scheduler"] == "noam" else cfg["fixed_lr"]
+    optimizer = torch.optim.Adam(model.parameters(), lr=base_lr,
+                                 betas=cfg["betas"], eps=cfg["eps"])
+
+    scheduler = None
+    if cfg["scheduler"] == "noam":
+        from lr_scheduler import NoamScheduler
+        scheduler = NoamScheduler(optimizer, d_model=cfg["d_model"],
+                                  warmup_steps=cfg["warmup_steps"])
+
+    loss_fn = LabelSmoothingLoss(vocab_size=len(tgt_vocab), pad_idx=1,
+                                 smoothing=cfg["label_smooth"])
+
+    # ── Training loop ───────────────────────────────────────────────
+    best_bleu = -1.0
+    best_epoch = -1
+    history = []
+
+    for epoch in range(cfg["num_epochs"]):
+        train_metrics = run_epoch(train_loader, model, loss_fn, optimizer, scheduler,
+                                  epoch_num=epoch, is_train=True, device=device,
+                                  pad_idx=1, wandb_run=wandb_run, grad_clip=cfg["grad_clip"])
+        val_metrics   = run_epoch(val_loader, model, loss_fn, optimizer=None, scheduler=None,
+                                  epoch_num=epoch, is_train=False, device=device,
+                                  pad_idx=1, wandb_run=None)
+
+        val_bleu = evaluate_bleu(model, val_loader, tgt_vocab, device=device, max_len=cfg["max_len"])
+        history.append({"epoch": epoch, **train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}, "val_bleu": val_bleu})
+
+        print(
+            f"[epoch {epoch:02d}] "
+            f"train_loss={train_metrics['loss']:.4f} "
+            f"val_loss={val_metrics['loss']:.4f} "
+            f"val_bleu={val_bleu:.2f}"
+        )
+
+        if wandb_run is not None:
+            wandb_run.log({
+                "epoch":            epoch,
+                "val/loss":         val_metrics["loss"],
+                "val/perplexity":   val_metrics["perplexity"],
+                "val/accuracy":     val_metrics["accuracy"],
+                "val/bleu":         val_bleu,
+            })
+
+        if val_bleu > best_bleu:
+            best_bleu  = val_bleu
+            best_epoch = epoch
+            save_checkpoint(model, optimizer, scheduler, epoch, path=cfg["checkpoint"])
+
+    # ── Final test BLEU ─────────────────────────────────────────────
+    load_checkpoint(cfg["checkpoint"], model)
+    test_bleu = evaluate_bleu(model, test_loader, tgt_vocab, device=device, max_len=cfg["max_len"])
+    print(f"[final] best_epoch={best_epoch} best_val_bleu={best_bleu:.2f} test_bleu={test_bleu:.2f}")
+
+    if wandb_run is not None:
+        wandb_run.log({"test_bleu": test_bleu, "best_val_bleu": best_bleu, "best_epoch": best_epoch})
+        wandb_run.finish()
+
+    return {"best_epoch": best_epoch, "best_val_bleu": best_bleu, "test_bleu": test_bleu, "history": history}
+
+
+# ── Ablation helpers ────────────────────────────────────────────────
+
+class _LearnedPositionalEncoding(nn.Module):
+    """For section 2.4 ablation: learned positional embeddings."""
+    def __init__(self, d_model: int, max_len: int, dropout: float = 0.1):
+        super().__init__()
+        self.embed = nn.Embedding(max_len, d_model)
+        self.drop  = nn.Dropout(dropout)
+        nn.init.normal_(self.embed.weight, mean=0.0, std=d_model ** -0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        L = x.size(1)
+        positions = torch.arange(L, device=x.device)
+        return self.drop(x + self.embed(positions).unsqueeze(0))
+
+
+def _build_learned_pe(d_model: int, max_len: int, dropout: float) -> nn.Module:
+    return _LearnedPositionalEncoding(d_model, max_len, dropout)
+
+
+def _disable_attention_scaling(model: Transformer) -> None:
+    """
+    Monkey-patch scaled_dot_product_attention to remove 1/sqrt(d_k) scaling.
+    Used for section 2.2 ablation. Applied PROCESS-WIDE so it persists for
+    the whole run; restore by restarting the process.
+    """
+    import model as model_mod
+
+    def no_scale_attn(Q, K, V, mask=None):
+        scores = torch.matmul(Q, K.transpose(-2, -1))   # no * scale
+        if mask is not None:
+            scores = scores.masked_fill(mask, float("-inf"))
+        alpha = torch.softmax(scores, dim=-1)
+        return torch.matmul(alpha, V), alpha
+
+    model_mod.scaled_dot_product_attention = no_scale_attn
 
 
 if __name__ == "__main__":
