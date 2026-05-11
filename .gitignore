@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# W&B
+wandb/
+.wandb/
+
+# Model artifacts
+*.pt
+*.pth
+checkpoint*.pt
+
+# Vocab files (rebuilt from data)
+vocab_*.pt
+*.vocab
+
+# Datasets / caches
+data/
+.cache/
+~/.cache/huggingface/
+
+# Notes (your own working files — don't share style profile)
+STYLE.md
+NOTES.md
