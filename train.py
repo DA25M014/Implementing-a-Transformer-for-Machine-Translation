@@ -432,11 +432,11 @@ def run_training_experiment(config: dict | None = None) -> dict:
     tgt_vocab = train_ds.tgt_vocab
 
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
-                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=2)
+                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
-                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=2)
+                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=0)
     test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"], shuffle=False,
-                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=2)
+                              collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=0)
 
     # ── Model ───────────────────────────────────────────────────────
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
