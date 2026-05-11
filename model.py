@@ -425,89 +425,132 @@ class Transformer(nn.Module):
     """
     Full encoder-decoder Transformer for sequence-to-sequence translation.
 
-    Architecture choices (justified in STYLE.md):
-      - Pre-LayerNorm throughout (see Encoder/Decoder docstrings).
-      - Decoder input embedding weight is TIED to the output projection
-        weight (Press & Wolf 2017, also paper Section 3.4). One matrix
-        does two jobs: trims parameters and slightly improves BLEU on
-        small datasets like Multi30k.
-      - Source and target embeddings are NOT tied (different vocabs).
-      - Embeddings are scaled by sqrt(d_model) before adding PE,
-        per paper Section 3.4.
-      - Xavier-uniform init on all Linear weights; embeddings initialised
-        from Normal(0, d_model^-0.5); biases zero.
+    Self-bootstrapping: a bare ``Transformer()`` call loads vocabularies,
+    spaCy tokenizers, and (when configured) downloads pretrained weights
+    via gdown -- all inside __init__, per the assignment\'s autograder contract.
 
-    Defaults on src/tgt vocab sizes are placeholders that let the model
-    instantiate with no args (autograder requirement). At inference time
-    these are overridden by the saved model_config in the checkpoint.
+    Architecture choices (full rationale in STYLE.md):
+      - Pre-LayerNorm throughout.
+      - Decoder input embedding TIED to output projection (Press & Wolf 2017).
+      - Source and target embeddings independent.
+      - Embeddings scaled by sqrt(d_model) before adding PE (paper Section 3.4).
+      - Xavier-uniform init on Linear, Normal(0, d_model^-0.5) on Embeddings.
+
+    Defaults for vocab sizes match the Multi30k vocab built from train split
+    with min_freq=2: de=8012, en=6190. These are baked in so the autograder
+    can call ``Transformer()`` with no arguments and get the right architecture.
     """
+
+    # ── Checkpoint plumbing ──────────────────────────────────────────
+    # When CHECKPOINT_GDRIVE_ID is non-None, __init__ will download the
+    # corresponding .pt file from Google Drive via gdown and load weights.
+    # Set this AFTER the first successful Kaggle training run that produces
+    # the canonical transformer_main.pt.
+    CHECKPOINT_GDRIVE_ID: str | None = None
+    CHECKPOINT_LOCAL_NAME: str       = "transformer_main.pt"
 
     def __init__(
         self,
-        src_vocab_size: int = 8000,
-        tgt_vocab_size: int = 6500,
+        src_vocab_size: int = 8012,
+        tgt_vocab_size: int = 6190,
         d_model:   int   = 512,
         N:         int   = 6,
         num_heads: int   = 8,
         d_ff:      int   = 2048,
         dropout:   float = 0.15,
         max_len:   int   = 128,
-        checkpoint_path: str = None,
+        artifacts_dir: str = "artifacts",
+        checkpoint_path: str | None = None,
     ) -> None:
         super().__init__()
         self.d_model        = d_model
         self.src_vocab_size = src_vocab_size
         self.tgt_vocab_size = tgt_vocab_size
         self.max_len        = max_len
+        self.artifacts_dir  = artifacts_dir
 
-        # Embeddings: source and target are independent.
+        # ── Architecture ─────────────────────────────────────────────
         self.src_embed = nn.Embedding(src_vocab_size, d_model, padding_idx=1)
         self.tgt_embed = nn.Embedding(tgt_vocab_size, d_model, padding_idx=1)
+        self.pos_enc   = PositionalEncoding(d_model, dropout=dropout, max_len=max_len)
 
-        # Shared positional encoding -- same sinusoidal table works for
-        # both source and target since PE depends only on (pos, d_model).
-        self.pos_enc = PositionalEncoding(d_model, dropout=dropout, max_len=max_len)
-
-        # Encoder and decoder stacks. Prototype layer is passed to the
-        # stack which re-constructs N copies internally.
         enc_layer = EncoderLayer(d_model, num_heads, d_ff, dropout=dropout)
         dec_layer = DecoderLayer(d_model, num_heads, d_ff, dropout=dropout)
         self.encoder = Encoder(enc_layer, N)
         self.decoder = Decoder(dec_layer, N)
 
-        # Output projection. Weight is TIED to the decoder embedding.
+        # Tied output projection.
         self.generator = nn.Linear(d_model, tgt_vocab_size, bias=False)
         self.generator.weight = self.tgt_embed.weight
 
-        # Placeholders for tokenizers and vocabs -- populated by the
-        # training pipeline before saving the checkpoint, and re-populated
-        # by the checkpoint-load path at inference time.
-        self.src_tokenizer = None
-        self.tgt_tokenizer = None
-        self.src_vocab     = None
-        self.tgt_vocab     = None
-
         self._init_weights()
 
-        # Optional checkpoint download stub. Actual weight loading is
-        # handled by the training/inference pipeline, not here, so this
-        # remains compatible with the skeleton without forcing every
-        # instantiation to require network access.
-        if checkpoint_path is not None:
-            import os
-            if not os.path.exists(checkpoint_path):
-                gdown.download(
-                    id="<REPLACE_WITH_GDRIVE_FILE_ID>",
-                    output=checkpoint_path,
-                    quiet=False,
+        # ── Vocab + tokenizer auto-load ──────────────────────────────
+        # Per the announcement: vocab and tokenizers must load in __init__.
+        # Failure here is NON-FATAL during unit tests where artifacts may
+        # be absent; only infer() will then raise.
+        self.src_vocab     = None
+        self.tgt_vocab     = None
+        self.src_tokenizer = None
+        self.tgt_tokenizer = None
+        self._load_vocab_and_tokenizers(artifacts_dir)
+
+        # ── Optional weight download + load ──────────────────────────
+        # checkpoint_path argument lets callers force a specific path;
+        # otherwise we fall back to CHECKPOINT_GDRIVE_ID + CHECKPOINT_LOCAL_NAME.
+        target_path = checkpoint_path or self.CHECKPOINT_LOCAL_NAME
+        if self.CHECKPOINT_GDRIVE_ID is not None or checkpoint_path is not None:
+            self._maybe_download_and_load_weights(target_path)
+
+    # ── Bootstrapping helpers ────────────────────────────────────────
+
+    def _load_vocab_and_tokenizers(self, artifacts_dir: str) -> None:
+        """
+        Load vocabs from artifacts/ and spaCy tokenizers eagerly.
+        Imports are local so unit tests of pure-architecture code do not
+        require the dataset module / spaCy to be importable.
+        """
+        try:
+            from pathlib import Path as _P
+            from dataset import Vocab, _make_spacy_tokenizer
+
+            adir = _P(artifacts_dir)
+            de_path = adir / "vocab_de.pt"
+            en_path = adir / "vocab_en.pt"
+            if de_path.exists() and en_path.exists():
+                self.src_vocab = Vocab.load(de_path)
+                self.tgt_vocab = Vocab.load(en_path)
+
+            self.src_tokenizer = _make_spacy_tokenizer("de_core_news_sm")
+            self.tgt_tokenizer = _make_spacy_tokenizer("en_core_web_sm")
+        except Exception as e:
+            # Swallow during early tests; infer() will surface a clear error later.
+            import warnings
+            warnings.warn(f"Transformer bootstrap (vocab/tokenizer) skipped: {e}")
+
+    def _maybe_download_and_load_weights(self, path: str) -> None:
+        """Download via gdown if not present, then load_state_dict."""
+        import os
+        if not os.path.exists(path):
+            if self.CHECKPOINT_GDRIVE_ID is None:
+                return
+            gdown.download(id=self.CHECKPOINT_GDRIVE_ID, output=path, quiet=False)
+
+        if os.path.exists(path):
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+            # Support both "raw state_dict" and "{model_state_dict: ...}" formats.
+            state = blob.get("model_state_dict", blob) if isinstance(blob, dict) else blob
+            missing, unexpected = self.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                import warnings
+                warnings.warn(
+                    f"load_state_dict had missing={missing} unexpected={unexpected}"
                 )
 
     def _init_weights(self) -> None:
-        """Xavier-uniform on Linear weights; tied output proj skipped."""
+        """Xavier-uniform on Linear; Normal(0, d^-0.5) on Embeddings."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                # Skip the tied generator -- its weight IS the tgt_embed weight,
-                # which we initialise separately as an embedding.
                 if module is self.generator:
                     continue
                 nn.init.xavier_uniform_(module.weight)
@@ -526,16 +569,6 @@ class Transformer(nn.Module):
         src:      torch.Tensor,
         src_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Embed source tokens, add PE, run encoder stack.
-
-        Args:
-            src      : Token indices, shape [B, src_len]
-            src_mask : shape [B, 1, 1, src_len]
-
-        Returns:
-            memory : Encoder output, shape [B, src_len, d_model]
-        """
         x = self.src_embed(src) * (self.d_model ** 0.5)
         x = self.pos_enc(x)
         return self.encoder(x, src_mask)
@@ -547,18 +580,6 @@ class Transformer(nn.Module):
         tgt:      torch.Tensor,
         tgt_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Embed target tokens, add PE, run decoder stack, project to vocab.
-
-        Args:
-            memory   : Encoder output,  shape [B, src_len, d_model]
-            src_mask : shape [B, 1, 1, src_len]
-            tgt      : Token indices,   shape [B, tgt_len]
-            tgt_mask : shape [B, 1, tgt_len, tgt_len]
-
-        Returns:
-            logits : shape [B, tgt_len, tgt_vocab_size]
-        """
         y = self.tgt_embed(tgt) * (self.d_model ** 0.5)
         y = self.pos_enc(y)
         y = self.decoder(y, memory, src_mask, tgt_mask)
@@ -571,9 +592,6 @@ class Transformer(nn.Module):
         src_mask: torch.Tensor,
         tgt_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Full encoder-decoder forward pass. Returns logits over target vocab.
-        """
         memory = self.encode(src, src_mask)
         return self.decode(memory, src_mask, tgt, tgt_mask)
 
@@ -581,11 +599,8 @@ class Transformer(nn.Module):
         """
         Translate a single German sentence to English.
 
-        Implementation lives in train.py (greedy_decode) plus this method
-        wrapping tokenization and detokenization. Wired up after the data
-        pipeline exists -- see Step 21 of the build plan.
+        Implementation wired up in Step 20 (greedy decoding + detokenization).
         """
         raise NotImplementedError(
-            "Transformer.infer is wired up after the data pipeline is in place. "
-            "See dataset.py + train.greedy_decode."
+            "infer() implementation pending Step 20 (greedy decoder + detokenization)."
         )
