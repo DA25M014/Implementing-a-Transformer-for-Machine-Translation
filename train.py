@@ -412,6 +412,7 @@ DEFAULT_CONFIG = {
     # I/O
     "artifacts_dir":  "artifacts",
     "checkpoint":     "transformer_main.pt",
+    "use_expanded":   False,
 }
 
 
@@ -447,13 +448,13 @@ def run_training_experiment(config: dict | None = None) -> dict:
     from dataset import Multi30kDataset, Vocab, collate_batch
 
     train_ds = Multi30kDataset(split="train",      artifacts_dir=cfg["artifacts_dir"],
-                               max_len=cfg["max_len"])
+                               max_len=cfg["max_len"], use_expanded=cfg["use_expanded"])
     if train_ds.src_vocab is None:
         train_ds.build_vocab(min_freq=2)
     val_ds  = Multi30kDataset(split="validation", artifacts_dir=cfg["artifacts_dir"],
-                               max_len=cfg["max_len"])
+                               max_len=cfg["max_len"], use_expanded=cfg["use_expanded"])
     test_ds = Multi30kDataset(split="test",       artifacts_dir=cfg["artifacts_dir"],
-                               max_len=cfg["max_len"])
+                               max_len=cfg["max_len"], use_expanded=cfg["use_expanded"])
 
     src_vocab = train_ds.src_vocab
     tgt_vocab = train_ds.tgt_vocab

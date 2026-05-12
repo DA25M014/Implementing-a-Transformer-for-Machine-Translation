@@ -35,3 +35,8 @@ NOTES.md
 artifacts/*
 !artifacts/vocab_de.pt
 !artifacts/vocab_en.pt
+
+# Expanded multi-reference data (built once locally)
+!artifacts/expanded_train.parquet
+!artifacts/expanded_val.parquet
+!artifacts/expanded_test.parquet

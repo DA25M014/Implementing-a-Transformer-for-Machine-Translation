@@ -127,16 +127,28 @@ class Multi30kDataset(Dataset):
         split: str = "train",
         artifacts_dir: str | Path = "artifacts",
         max_len: int = 128,
+        use_expanded: bool = False,
     ):
         assert split in {"train", "validation", "test"}, f"bad split {split}"
         self.split = split
         self.artifacts_dir = Path(artifacts_dir)
         self.max_len = max_len
+        self.use_expanded = use_expanded
 
         self.tokenize_de = _make_spacy_tokenizer("de_core_news_sm")
         self.tokenize_en = _make_spacy_tokenizer("en_core_web_sm")
 
-        self._hf_split = load_dataset(self.HF_NAME, split=split)
+        if use_expanded:
+            # Load pre-built multi-reference parquet.
+            import pandas as pd
+            split_file = {"train": "expanded_train.parquet",
+                          "validation": "expanded_val.parquet",
+                          "test": "expanded_test.parquet"}[split]
+            df = pd.read_parquet(self.artifacts_dir / split_file)
+            # Build a list of {"de": ..., "en": ...} matching HF interface.
+            self._hf_split = [{"de": r.de, "en": r.en} for r in df.itertuples(index=False)]
+        else:
+            self._hf_split = load_dataset(self.HF_NAME, split=split)
 
         # Vocabs may not exist yet (first build call).
         self.src_vocab: Vocab | None = None
