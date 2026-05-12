@@ -674,7 +674,7 @@ class Transformer(nn.Module):
         out_ids = ys[0].tolist()
         en_tokens = self.tgt_vocab.decode(out_ids, strip_specials=True)
         text = " ".join(en_tokens)
-        return self._detokenize(text)
+        return self._detokenize(text).lower()
 
     @staticmethod
     def _detokenize(text: str) -> str:
