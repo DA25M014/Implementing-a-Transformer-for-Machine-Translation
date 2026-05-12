@@ -139,6 +139,7 @@ def run_epoch(
     log_every: int = 50,
     wandb_run=None,
     grad_clip: float = 1.0,
+    use_amp: bool = False,
 ) -> dict[str, float]:
     """
     Run one epoch of training or evaluation.
@@ -162,9 +163,16 @@ def run_epoch(
         src_mask = make_src_mask(src, pad_idx=pad_idx).to(device)
         tgt_mask = make_tgt_mask(tgt_in, pad_idx=pad_idx).to(device)
 
-        logits = model(src, tgt_in, src_mask, tgt_mask)
-        V      = logits.size(-1)
-        loss   = loss_fn(logits.reshape(-1, V), tgt_out.reshape(-1))
+        amp_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if (use_amp and device == "cuda")
+            else torch.amp.autocast(device_type="cpu", enabled=False)
+        )
+
+        with amp_ctx:
+            logits = model(src, tgt_in, src_mask, tgt_mask)
+            V      = logits.size(-1)
+            loss   = loss_fn(logits.reshape(-1, V), tgt_out.reshape(-1))
 
         if is_train:
             optimizer.zero_grad()
@@ -257,21 +265,30 @@ def evaluate_bleu(
     tgt_vocab,
     device: str = "cpu",
     max_len: int = 100,
+    raw_references: list = None,
 ) -> float:
     """
     Corpus-level BLEU via sacrebleu, computed by greedy-decoding each
-    source sentence and comparing to the reference target sentence.
+    source sentence.
 
-    Returns: BLEU in [0, 100].
+    IMPORTANT: When raw_references is supplied (list of original English
+    strings from the HuggingFace dataset), BLEU is computed against
+    THOSE raw strings using the model\'s detokenized output. This matches
+    what the autograder does and gives an honest BLEU number.
+
+    When raw_references is None, we fall back to vocab-roundtripped
+    references (the old behaviour, kept for backwards compatibility
+    in unit tests). That mode reports inflated BLEU because rare words
+    become <unk> on both sides and get stripped.
     """
     import sacrebleu
 
     model = model.to(device).eval()
     hypotheses, references = [], []
+    sentence_idx = 0
 
     with torch.no_grad():
         for src, tgt in test_dataloader:
-            # Process one sentence at a time; greedy_decode expects batch=1.
             for i in range(src.size(0)):
                 s = src[i:i+1].to(device)
                 t = tgt[i].tolist()
@@ -285,10 +302,17 @@ def evaluate_bleu(
                     device=device,
                 )
                 hyp_tokens = tgt_vocab.decode(y[0].tolist(), strip_specials=True)
-                ref_tokens = tgt_vocab.decode(t,            strip_specials=True)
+                hyp_str    = " ".join(hyp_tokens)
+                # Apply the same detokenisation as Transformer.infer
+                hyp_str    = Transformer._detokenize(hyp_str)
+                hypotheses.append(hyp_str)
 
-                hypotheses.append(" ".join(hyp_tokens))
-                references.append(" ".join(ref_tokens))
+                if raw_references is not None:
+                    references.append(raw_references[sentence_idx])
+                else:
+                    ref_tokens = tgt_vocab.decode(t, strip_specials=True)
+                    references.append(" ".join(ref_tokens))
+                sentence_idx += 1
 
     bleu = sacrebleu.corpus_bleu(hypotheses, [references])
     return float(bleu.score)
@@ -364,6 +388,9 @@ DEFAULT_CONFIG = {
     "batch_size":     128,
     "num_epochs":     25,
     "warmup_steps":   4500,
+    "eval_every":     1,           # epochs between val BLEU evals
+    "use_amp":        False,       # bf16 autocast (CUDA only)
+    "early_stop_patience": 5,      # stop if val BLEU does not improve for N evals
     "label_smooth":   0.1,
     "betas":          (0.9, 0.98),
     "eps":            1e-9,
@@ -470,20 +497,32 @@ def run_training_experiment(config: dict | None = None) -> dict:
     loss_fn = LabelSmoothingLoss(vocab_size=len(tgt_vocab), pad_idx=1,
                                  smoothing=cfg["label_smooth"])
 
+    # Pull raw English references from HF dataset for honest BLEU.
+    raw_val_refs  = [val_ds._hf_split[i]["en"]  for i in range(len(val_ds))]
+    raw_test_refs = [test_ds._hf_split[i]["en"] for i in range(len(test_ds))]
+
     # ── Training loop ───────────────────────────────────────────────
     best_bleu = -1.0
     best_epoch = -1
+    no_improve_evals = 0
     history = []
 
     for epoch in range(cfg["num_epochs"]):
         train_metrics = run_epoch(train_loader, model, loss_fn, optimizer, scheduler,
                                   epoch_num=epoch, is_train=True, device=device,
-                                  pad_idx=1, wandb_run=wandb_run, grad_clip=cfg["grad_clip"])
+                                  pad_idx=1, wandb_run=wandb_run, grad_clip=cfg["grad_clip"],
+                                  use_amp=cfg["use_amp"])
         val_metrics   = run_epoch(val_loader, model, loss_fn, optimizer=None, scheduler=None,
                                   epoch_num=epoch, is_train=False, device=device,
-                                  pad_idx=1, wandb_run=None)
+                                  pad_idx=1, wandb_run=None, use_amp=cfg["use_amp"])
 
-        val_bleu = evaluate_bleu(model, val_loader, tgt_vocab, device=device, max_len=cfg["max_len"])
+        # Val BLEU only every cfg["eval_every"] epochs (and always on the last)
+        do_eval = ((epoch % cfg["eval_every"]) == 0) or (epoch == cfg["num_epochs"] - 1)
+        if do_eval:
+            val_bleu = evaluate_bleu(model, val_loader, tgt_vocab, device=device,
+                                     max_len=cfg["max_len"], raw_references=raw_val_refs)
+        else:
+            val_bleu = float("nan")
         history.append({"epoch": epoch, **train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}, "val_bleu": val_bleu})
 
         print(
@@ -502,14 +541,23 @@ def run_training_experiment(config: dict | None = None) -> dict:
                 "val/bleu":         val_bleu,
             })
 
-        if val_bleu > best_bleu:
-            best_bleu  = val_bleu
-            best_epoch = epoch
-            save_checkpoint(model, optimizer, scheduler, epoch, path=cfg["checkpoint"])
+        if do_eval:
+            if val_bleu > best_bleu:
+                best_bleu  = val_bleu
+                best_epoch = epoch
+                no_improve_evals = 0
+                save_checkpoint(model, optimizer, scheduler, epoch, path=cfg["checkpoint"])
+            else:
+                no_improve_evals += 1
+                if no_improve_evals >= cfg["early_stop_patience"]:
+                    print(f"Early stop at epoch {epoch} "
+                          f"(no improvement for {no_improve_evals} evals)")
+                    break
 
     # ── Final test BLEU ─────────────────────────────────────────────
     load_checkpoint(cfg["checkpoint"], model)
-    test_bleu = evaluate_bleu(model, test_loader, tgt_vocab, device=device, max_len=cfg["max_len"])
+    test_bleu = evaluate_bleu(model, test_loader, tgt_vocab, device=device,
+                              max_len=cfg["max_len"], raw_references=raw_test_refs)
     print(f"[final] best_epoch={best_epoch} best_val_bleu={best_bleu:.2f} test_bleu={test_bleu:.2f}")
 
     if wandb_run is not None:
