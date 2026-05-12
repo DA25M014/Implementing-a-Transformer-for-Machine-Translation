@@ -446,7 +446,7 @@ class Transformer(nn.Module):
     # corresponding .pt file from Google Drive via gdown and load weights.
     # Set this AFTER the first successful Kaggle training run that produces
     # the canonical transformer_main.pt.
-    CHECKPOINT_GDRIVE_ID: str | None = None
+    CHECKPOINT_GDRIVE_ID: str | None = "15e-O7Ji4kMnLrmaTBY5hmjnW6xpuJKGS"
     CHECKPOINT_LOCAL_NAME: str       = "transformer_main.pt"
 
     def __init__(
