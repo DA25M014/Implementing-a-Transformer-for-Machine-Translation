@@ -507,6 +507,12 @@ class Transformer(nn.Module):
     def _load_vocab_and_tokenizers(self, artifacts_dir: str) -> None:
         """
         Load vocabs from artifacts/ and spaCy tokenizers eagerly.
+
+        If a spaCy model is missing, attempt a runtime install via
+        ``python -m spacy download``. This makes the Transformer
+        self-sufficient on autograder machines that did not pre-install
+        the language models.
+
         Imports are local so unit tests of pure-architecture code do not
         require the dataset module / spaCy to be importable.
         """
@@ -521,12 +527,32 @@ class Transformer(nn.Module):
                 self.src_vocab = Vocab.load(de_path)
                 self.tgt_vocab = Vocab.load(en_path)
 
-            self.src_tokenizer = _make_spacy_tokenizer("de_core_news_sm")
-            self.tgt_tokenizer = _make_spacy_tokenizer("en_core_web_sm")
+            self.src_tokenizer = self._safe_load_spacy("de_core_news_sm")
+            self.tgt_tokenizer = self._safe_load_spacy("en_core_web_sm")
         except Exception as e:
-            # Swallow during early tests; infer() will surface a clear error later.
             import warnings
             warnings.warn(f"Transformer bootstrap (vocab/tokenizer) skipped: {e}")
+
+    @staticmethod
+    def _safe_load_spacy(model_name: str):
+        """
+        Return a callable str->list[str] tokenizer for the given spaCy model.
+        If the model is not installed, run ``python -m spacy download`` first.
+        """
+        import sys, subprocess, spacy
+        from dataset import _make_spacy_tokenizer
+        try:
+            return _make_spacy_tokenizer(model_name)
+        except OSError:
+            # Model not installed -- fetch it once, then retry.
+            subprocess.run(
+                [sys.executable, "-m", "spacy", "download", model_name],
+                check=True,
+            )
+            # spaCy sometimes needs a fresh import after install.
+            import importlib
+            importlib.invalidate_caches()
+            return _make_spacy_tokenizer(model_name)
 
     def _maybe_download_and_load_weights(self, path: str) -> None:
         """Download via gdown if not present, then load_state_dict."""

@@ -30,4 +30,8 @@ data/
 # Notes (your own working files — don't share style profile)
 STYLE.md
 NOTES.md
-artifacts/
+
+# Vocab files are needed by Transformer.__init__ at autograde time
+artifacts/*
+!artifacts/vocab_de.pt
+!artifacts/vocab_en.pt
