@@ -644,7 +644,7 @@ class Transformer(nn.Module):
             )
 
         # Local import to avoid circular dependency (train.py imports model.py).
-        from train import beam_search_decode
+        from train import greedy_decode
 
         device = next(self.parameters()).device
 
@@ -653,23 +653,20 @@ class Transformer(nn.Module):
         src_ids   = self.src_vocab.encode(de_tokens, add_specials=True)
         src       = torch.tensor([src_ids], dtype=torch.long, device=device)
 
-        # Source padding mask.
+        # Source padding mask: no padding in a single-sentence batch.
         src_mask = (src == self.tgt_vocab.PAD_IDX).unsqueeze(1).unsqueeze(2)
 
-        # Beam=2 search with tight length cap. Per-sentence cost is ~2x greedy
-        # which fits comfortably inside autograder timeout budgets.
-        out_max_len = min(self.max_len, len(src_ids) + 8)
+        # Greedy decode -- cap output length proportional to source length
+        # plus a small additive slack (NMT heuristic; prevents runaway generation).
+        out_max_len = min(self.max_len, len(src_ids) + 10)
 
-        ys = beam_search_decode(
+        ys = greedy_decode(
             model=self,
             src=src,
             src_mask=src_mask,
             max_len=out_max_len,
             start_symbol=self.tgt_vocab.SOS_IDX,
             end_symbol=self.tgt_vocab.EOS_IDX,
-            pad_idx=self.tgt_vocab.PAD_IDX,
-            beam_size=2,
-            length_penalty=0.6,
             device=str(device),
         )
 
