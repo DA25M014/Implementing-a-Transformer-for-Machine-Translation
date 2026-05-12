@@ -670,7 +670,28 @@ class Transformer(nn.Module):
             device=str(device),
         )
 
-        # Detokenize: strip specials, join with spaces.
+        # Detokenize: strip specials, join with spaces, then fix punctuation.
         out_ids = ys[0].tolist()
         en_tokens = self.tgt_vocab.decode(out_ids, strip_specials=True)
-        return " ".join(en_tokens)
+        text = " ".join(en_tokens)
+        return self._detokenize(text)
+
+    @staticmethod
+    def _detokenize(text: str) -> str:
+        """
+        Collapse whitespace introduced by space-joining BPE-style tokens
+        back into natural English punctuation. Matches the convention
+        sacrebleu\'s default tokenizer expects on reference strings.
+        """
+        import re as _re
+        # Remove space BEFORE: . , ! ? ; : %  and closing brackets ) ] }
+        text = _re.sub(r"\s+([.,!?;:%)\]\}])", r"\1", text)
+        # Remove space AFTER opening brackets ( [ {  and dollar/hash etc.
+        text = _re.sub(r"([(\[\{\$#@])\s+", r"\1", text)
+        # Glue contractions:  n't  's  're  've  'll  'd  'm
+        text = _re.sub(r"\s+(n\u0027t|\u0027s|\u0027re|\u0027ve|\u0027ll|\u0027d|\u0027m)\b",
+                       r"\1", text)
+        text = _re.sub(r"\s+('t|'s|'re|'ve|'ll|'d|'m)\b", r"\1", text)
+        # Collapse multiple internal spaces
+        text = _re.sub(r"\s{2,}", " ", text)
+        return text.strip()
