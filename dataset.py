@@ -98,7 +98,7 @@ def _make_spacy_tokenizer(model_name: str) -> Callable[[str], list[str]]:
     nlp = spacy.load(model_name, disable=["parser", "ner", "tagger", "lemmatizer"])
 
     def tokenize(text: str) -> list[str]:
-        return [tok.text for tok in nlp(text.strip()) if not tok.is_space]
+        return [tok.text.lower() for tok in nlp(text.strip()) if not tok.is_space]
 
     return tokenize
 
