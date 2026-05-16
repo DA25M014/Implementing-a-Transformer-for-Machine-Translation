@@ -40,3 +40,4 @@ artifacts/*
 !artifacts/expanded_train.parquet
 !artifacts/expanded_val.parquet
 !artifacts/expanded_test.parquet
+backups/
