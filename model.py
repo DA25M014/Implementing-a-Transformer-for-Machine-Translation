@@ -297,12 +297,11 @@ class EncoderLayer(nn.Module):
         self.drop      = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
-        # Sub-layer 1: self-attention with pre-norm residual
-        normed = self.norm1(x)
-        x = x + self.drop(self.self_attn(normed, normed, normed, mask=src_mask))
+        # Sub-layer 1: self-attention with Post-LN residual (paper-standard)
+        x = self.norm1(x + self.drop(self.self_attn(x, x, x, mask=src_mask)))
 
-        # Sub-layer 2: feed-forward with pre-norm residual
-        x = x + self.drop(self.ffn(self.norm2(x)))
+        # Sub-layer 2: feed-forward with Post-LN residual
+        x = self.norm2(x + self.drop(self.ffn(x)))
         return x
 
 
@@ -338,16 +337,14 @@ class DecoderLayer(nn.Module):
         src_mask: torch.Tensor,
         tgt_mask: torch.Tensor,
     ) -> torch.Tensor:
-        # Sub-layer 1: masked self-attention
-        normed = self.norm1(x)
-        x = x + self.drop(self.self_attn(normed, normed, normed, mask=tgt_mask))
+        # Sub-layer 1: masked self-attention (Post-LN)
+        x = self.norm1(x + self.drop(self.self_attn(x, x, x, mask=tgt_mask)))
 
-        # Sub-layer 2: cross-attention to encoder memory
-        normed = self.norm2(x)
-        x = x + self.drop(self.cross_attn(normed, memory, memory, mask=src_mask))
+        # Sub-layer 2: cross-attention to encoder memory (Post-LN)
+        x = self.norm2(x + self.drop(self.cross_attn(x, memory, memory, mask=src_mask)))
 
-        # Sub-layer 3: feed-forward
-        x = x + self.drop(self.ffn(self.norm3(x)))
+        # Sub-layer 3: feed-forward (Post-LN)
+        x = self.norm3(x + self.drop(self.ffn(x)))
         return x
 
 
