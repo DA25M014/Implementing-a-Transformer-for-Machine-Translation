@@ -448,8 +448,8 @@ class Transformer(nn.Module):
 
     def __init__(
         self,
-        src_vocab_size: int = 8012,
-        tgt_vocab_size: int = 6190,
+        src_vocab_size: int = 7851,
+        tgt_vocab_size: int = 5892,
         d_model:   int   = 256,
         N:         int   = 3,
         num_heads: int   = 8,
