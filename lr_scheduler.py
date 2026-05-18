@@ -18,22 +18,23 @@ from torch.optim.lr_scheduler import LRScheduler
 
 class NoamScheduler(LRScheduler):
     """
-    Noam learning rate schedule from "Attention Is All You Need".
+    Implementation of the learning-rate schedule from
+    Vaswani et al. (2017), "Attention Is All You Need".
 
-    Two arms:
-        arm_warmup = step * warmup_steps^(-1.5)   (linear warmup)
-        arm_decay  = step^(-0.5)                  (inverse-sqrt decay)
+    Rather than expressing the schedule as the original
+    `d_model^-0.5 * min(t^-0.5, t * W^-1.5)` form, we express it as
+    a piecewise function over the training step `t`:
 
-    The effective scale at step t is:
-        scale(t) = d_model^(-0.5) * min(arm_decay, arm_warmup)
+        - For 1 <= t <= W:   lr(t) = peak * (t / W)
+        - For t >  W:        lr(t) = peak * sqrt(W / t)
 
-    The crossover happens exactly at step == warmup_steps, where both
-    arms equal warmup_steps^(-0.5). The peak LR is therefore:
-        lr_peak = d_model^(-0.5) * warmup_steps^(-0.5)
+    where peak = (d_model * W)^-0.5 is the value at t == W. This
+    factorisation lets us precompute `peak` once and reduces each
+    step to a single multiplication plus a cheap branch.
 
-    Because this scheduler multiplies each param group's base_lr by
-    this scale, initialize your optimizer with lr=1.0 so the schedule
-    produces raw Noam values (not a scaled-down version).
+    The class multiplies each parameter group's `base_lr` by this
+    schedule, so initialise the optimiser with `lr=1.0` to get the
+    raw Noam values.
     """
 
     def __init__(
@@ -43,31 +44,41 @@ class NoamScheduler(LRScheduler):
         warmup_steps: int,
         last_epoch: int = -1,
     ) -> None:
-        if d_model <= 0:
-            raise ValueError(f"d_model must be positive, got {d_model}")
-        if warmup_steps <= 0:
-            raise ValueError(f"warmup_steps must be positive, got {warmup_steps}")
+        if d_model <= 0 or warmup_steps <= 0:
+            raise ValueError(
+                f"d_model and warmup_steps must be positive "
+                f"(got d_model={d_model}, warmup_steps={warmup_steps})"
+            )
 
-        self.d_model      = d_model
-        self.warmup_steps = warmup_steps
+        # Cast to int once so subsequent arithmetic is predictable.
+        self._D = int(d_model)
+        self._W = int(warmup_steps)
 
-        # Precompute the model-dim factor; reused on every step.
-        self._dim_factor = d_model ** -0.5
+        # Peak LR multiplier; reached at step == W. Cached once.
+        self._peak_scale = (self._D * self._W) ** -0.5
 
         super().__init__(optimizer, last_epoch=last_epoch)
 
-    def _get_lr_scale(self) -> float:
-        step = self.last_epoch + 1                          # avoid step == 0
-
-        arm_decay  = step ** -0.5
-        arm_warmup = step * (self.warmup_steps ** -1.5)
-
-        return self._dim_factor * min(arm_decay, arm_warmup)
-
     def get_lr(self) -> list[float]:
-        if not self.base_lrs:
-            return []
-        scale = self._get_lr_scale()
+        # `last_epoch` is incremented by the base class on each step;
+        # at the very first call last_epoch == 0, hence step == 1.
+        step = self.last_epoch + 1
+
+        if step <= 0:
+            # Defensive: shouldn't happen via normal use.
+            return [0.0 for _ in self.base_lrs]
+
+        # Phase-explicit form of the Noam schedule.
+        if step < self._W:
+            # Linear warm-up phase.
+            scale = self._peak_scale * (step / self._W)
+        elif step == self._W:
+            # Crossover step: warm-up and decay arms coincide.
+            scale = self._peak_scale
+        else:
+            # Inverse-square-root decay phase.
+            scale = self._peak_scale * ((self._W / step) ** 0.5)
+
         return [base * scale for base in self.base_lrs]
 
 
