@@ -41,3 +41,4 @@ artifacts/*
 !artifacts/expanded_val.parquet
 !artifacts/expanded_test.parquet
 backups/
+tools/

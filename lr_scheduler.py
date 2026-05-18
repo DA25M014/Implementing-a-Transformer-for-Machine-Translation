@@ -1,41 +1,29 @@
-"""
+'''
 Noam Learning Rate Scheduler
 Reference: "Attention Is All You Need" (Vaswani et al., 2017)
            https://arxiv.org/abs/1706.03762
 
 Formula:
     lrate = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5))
-"""
+'''
 
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import LRScheduler
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # TODO: Implement the NoamScheduler class below
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 class NoamScheduler(LRScheduler):
-    """
-    Implementation of the learning-rate schedule from
-    Vaswani et al. (2017), "Attention Is All You Need".
-
-    Rather than expressing the schedule as the original
-    `d_model^-0.5 * min(t^-0.5, t * W^-1.5)` form, we express it as
-    a piecewise function over the training step `t`:
-
-        - For 1 <= t <= W:   lr(t) = peak * (t / W)
-        - For t >  W:        lr(t) = peak * sqrt(W / t)
-
-    where peak = (d_model * W)^-0.5 is the value at t == W. This
-    factorisation lets us precompute `peak` once and reduces each
-    step to a single multiplication plus a cheap branch.
-
-    The class multiplies each parameter group's `base_lr` by this
-    schedule, so initialise the optimiser with `lr=1.0` to get the
-    raw Noam values.
-    """
+    '''
+    Noam learning rate schedule.
+        step <= W:  lr = peak * (step / W)
+        step >  W:  lr = peak * sqrt(W / step)
+    where W = warmup_steps and peak = (d_model * W) ** -0.5.
+    Multiplies base_lr from the optimizer, so use lr=1.0.
+    '''
 
     def __init__(
         self,
@@ -83,16 +71,16 @@ class NoamScheduler(LRScheduler):
 
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # Helper — do NOT modify
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 
 def get_lr_history(
     d_model: int,
     warmup_steps: int,
     total_steps: int,
 ) -> list[float]:
-    """
+    '''
     Simulate the LR trajectory of NoamScheduler for `total_steps` steps.
 
     Args:
@@ -102,7 +90,7 @@ def get_lr_history(
 
     Returns:
         list[float]: LR value at each step (length == total_steps).
-    """
+    '''
     dummy_model = torch.nn.Linear(1, 1)
     optimizer   = optim.Adam(dummy_model.parameters(), lr=1.0)
     scheduler   = NoamScheduler(optimizer, d_model=d_model, warmup_steps=warmup_steps)
@@ -116,9 +104,9 @@ def get_lr_history(
     return history
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # Quick visual check — run:  python noam_lr_scheduler.py
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt

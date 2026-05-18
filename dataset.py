@@ -1,4 +1,4 @@
-"""
+'''
 dataset.py -- Multi30k loader, spaCy tokenization, custom Vocab.
 
 No torchtext (deprecated). Vocab is a thin Python dict with explicit
@@ -6,7 +6,7 @@ special-token ordering: <unk>=0, <pad>=1, <sos>=2, <eos>=3.
 
 Pad index is hard-coded to 1 because model.py\'s make_src_mask and
 make_tgt_mask default to pad_idx=1.
-"""
+'''
 
 import os
 from collections import Counter
@@ -20,17 +20,17 @@ import spacy
 from datasets import load_dataset
 
 
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 #  VOCAB
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 
 class Vocab:
-    """
+    '''
     Minimal vocabulary class. Stores stoi (string -> int) and itos (int -> string).
 
     Special tokens are baked in at fixed positions:
         <unk>=0, <pad>=1, <sos>=2, <eos>=3
-    """
+    '''
 
     SPECIALS = ["<unk>", "<pad>", "<sos>", "<eos>"]
     UNK_IDX  = 0
@@ -67,14 +67,14 @@ class Vocab:
         return self.stoi.get(token, self.UNK_IDX)
 
     def encode(self, tokens: list[str], add_specials: bool = True) -> list[int]:
-        """Convert tokens to ids. With add_specials, wraps in <sos> ... <eos>."""
+        '''Convert tokens to ids. With add_specials, wraps in <sos> ... <eos>.'''
         ids = [self.stoi.get(t, self.UNK_IDX) for t in tokens]
         if add_specials:
             ids = [self.SOS_IDX] + ids + [self.EOS_IDX]
         return ids
 
     def decode(self, ids: list[int], strip_specials: bool = True) -> list[str]:
-        """Convert ids back to tokens. Optionally drop all special tokens."""
+        '''Convert ids back to tokens. Optionally drop all special tokens.'''
         tokens = [self.itos[i] if 0 <= i < len(self.itos) else "<unk>" for i in ids]
         if strip_specials:
             tokens = [t for t in tokens if t not in self.SPECIALS]
@@ -89,12 +89,12 @@ class Vocab:
         return cls(blob["stoi"], blob["itos"])
 
 
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 #  TOKENIZER HELPERS
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 
 def _make_spacy_tokenizer(model_name: str) -> Callable[[str], list[str]]:
-    """Returns a function that maps a raw string to a list of token strings."""
+    '''Returns a function that maps a raw string to a list of token strings.'''
     nlp = spacy.load(model_name, disable=["parser", "ner", "tagger", "lemmatizer"])
 
     def tokenize(text: str) -> list[str]:
@@ -103,12 +103,12 @@ def _make_spacy_tokenizer(model_name: str) -> Callable[[str], list[str]]:
     return tokenize
 
 
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 #  MULTI30K DATASET
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 
 class Multi30kDataset(Dataset):
-    """
+    '''
     Multi30k German->English translation dataset, wrapping the
     bentrevett/multi30k HuggingFace release.
 
@@ -118,7 +118,7 @@ class Multi30kDataset(Dataset):
 
     Vocabularies are built once from the TRAIN split and saved to disk.
     Validation and test splits reuse the same vocabs.
-    """
+    '''
 
     HF_NAME = "bentrevett/multi30k"
 
@@ -155,15 +155,15 @@ class Multi30kDataset(Dataset):
         self.tgt_vocab: Vocab | None = None
         self._try_load_vocabs()
 
-    # ── public API ───────────────────────────────────────────────────
+    # -- public API ---------------------------------------------------
 
     def build_vocab(self, min_freq: int = 2) -> tuple[Vocab, Vocab]:
-        """
+        '''
         Build src (de) and tgt (en) vocabularies from THIS split.
 
         Should be called on the TRAIN split only; vocabs are then saved
         to artifacts/ and reused by val/test instances via _try_load_vocabs.
-        """
+        '''
         if self.split != "train":
             raise RuntimeError(
                 f"build_vocab must be called on train split, got {self.split!r}"
@@ -188,7 +188,7 @@ class Multi30kDataset(Dataset):
             self.src_vocab = Vocab.load(de_path)
             self.tgt_vocab = Vocab.load(en_path)
 
-    # ── PyTorch Dataset interface ────────────────────────────────────
+    # -- PyTorch Dataset interface ------------------------------------
 
     def __len__(self) -> int:
         return len(self._hf_split)
@@ -212,18 +212,18 @@ class Multi30kDataset(Dataset):
         )
 
 
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 #  COLLATE FUNCTION
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------
 
 def collate_batch(batch, pad_idx: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
-    """
+    '''
     Pad a batch of (src_ids, tgt_ids) variable-length sequences to the
     longest in the batch. Returns:
         src : [B, max_src_len]  long
         tgt : [B, max_tgt_len]  long
     Use with DataLoader: collate_fn=collate_batch
-    """
+    '''
     srcs, tgts = zip(*batch)
 
     max_src = max(s.size(0) for s in srcs)

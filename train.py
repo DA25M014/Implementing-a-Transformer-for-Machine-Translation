@@ -1,4 +1,4 @@
-"""
+'''
 train.py -- Training pipeline, evaluation, checkpointing.
 
 Implements the autograder contract:
@@ -11,7 +11,7 @@ Plus the orchestration:
     LabelSmoothingLoss   -- KL-divergence form, eps/(V-1) mass on wrong classes.
     run_epoch            -- one train or eval epoch with W&B logging hooks.
     run_training_experiment(config) -- single entrypoint for all 5 ablation runs.
-"""
+'''
 
 import math
 import os
@@ -25,12 +25,12 @@ from torch.utils.data import DataLoader
 from model import Transformer, make_src_mask, make_tgt_mask
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  LABEL SMOOTHING LOSS
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 class LabelSmoothingLoss(nn.Module):
-    """
+    '''
     Label smoothing via explicit smoothed-target KL divergence.
 
     Smoothed distribution per token:
@@ -44,7 +44,7 @@ class LabelSmoothingLoss(nn.Module):
 
     Loss is the KL divergence sum over the vocabulary axis, averaged
     over non-pad target tokens.
-    """
+    '''
 
     def __init__(self, vocab_size: int, pad_idx: int = 1, smoothing: float = 0.1) -> None:
         super().__init__()
@@ -55,14 +55,14 @@ class LabelSmoothingLoss(nn.Module):
         self.criterion  = nn.KLDivLoss(reduction="sum")
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
+        '''
         Args:
             logits : [N, V] raw logits (typically logits.reshape(-1, V))
             target : [N]    gold ids
 
         Returns:
             scalar loss, averaged over non-pad tokens
-        """
+        '''
         assert logits.size(1) == self.vocab_size,             f"logits dim {logits.size(1)} != vocab {self.vocab_size}"
 
         # Build the smoothed target distribution.
@@ -82,18 +82,18 @@ class LabelSmoothingLoss(nn.Module):
         return loss_sum / n_nonpad
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  TRAINING / EVAL EPOCH
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 def _qk_grad_norms(model: Transformer) -> tuple[float, float]:
-    """
+    '''
     Aggregate the Frobenius norms of all Q and K projection gradients
     in the encoder + decoder self-attention layers.
 
     Returns (q_norm, k_norm). Each is the L2 norm of the concatenated
     grads from every layer. Used for the section 2.2 ablation analysis.
-    """
+    '''
     q_grads, k_grads = [], []
     for module_path, module in model.named_modules():
         if not module_path.endswith("self_attn"):
@@ -114,10 +114,10 @@ def _qk_grad_norms(model: Transformer) -> tuple[float, float]:
 
 
 def _prediction_confidence(logits: torch.Tensor, target: torch.Tensor, pad_idx: int = 1) -> float:
-    """
+    '''
     Mean softmax probability assigned to the correct token, averaged over
     non-pad positions. Used for the section 2.5 label-smoothing analysis.
-    """
+    '''
     probs = F.softmax(logits, dim=-1)
     correct_probs = probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
     mask = (target != pad_idx)
@@ -141,12 +141,12 @@ def run_epoch(
     grad_clip: float = 1.0,
     use_amp: bool = False,
 ) -> dict[str, float]:
-    """
+    '''
     Run one epoch of training or evaluation.
 
     Returns a dict with: 'loss', 'perplexity', 'accuracy'.
     On train epochs, also logs per-step metrics to W&B if wandb_run is provided.
-    """
+    '''
     model.train(is_train)
 
     total_loss, total_tokens, total_correct = 0.0, 0, 0
@@ -217,9 +217,9 @@ def run_epoch(
     }
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  GREEDY DECODING  (kept from Step 20)
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 def greedy_decode(
     model: Transformer,
@@ -230,11 +230,11 @@ def greedy_decode(
     end_symbol: int,
     device: str = "cpu",
 ) -> torch.Tensor:
-    """
+    '''
     Token-by-token greedy decoding from a trained Transformer.
     Encoder runs once outside the loop; decoder is called per step
     on a growing prefix.
-    """
+    '''
     model = model.to(device)
     src      = src.to(device)
     src_mask = src_mask.to(device)
@@ -255,9 +255,9 @@ def greedy_decode(
     return ys
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  BLEU EVALUATION
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 def evaluate_bleu(
     model: Transformer,
@@ -267,7 +267,7 @@ def evaluate_bleu(
     max_len: int = 100,
     raw_references: list = None,
 ) -> float:
-    """
+    '''
     Corpus-level BLEU via sacrebleu, computed by greedy-decoding each
     source sentence.
 
@@ -280,7 +280,7 @@ def evaluate_bleu(
     references (the old behaviour, kept for backwards compatibility
     in unit tests). That mode reports inflated BLEU because rare words
     become <unk> on both sides and get stripped.
-    """
+    '''
     import sacrebleu
 
     model = model.to(device).eval()
@@ -318,9 +318,9 @@ def evaluate_bleu(
     return float(bleu.score)
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  CHECKPOINT UTILITIES
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 def save_checkpoint(
     model: Transformer,
@@ -329,10 +329,10 @@ def save_checkpoint(
     epoch: int,
     path: str = "checkpoint.pt",
 ) -> None:
-    """
+    '''
     Save model + optimizer + scheduler state, plus the model_config dict
     needed to reconstruct the architecture at load time.
-    """
+    '''
     model_config = {
         "src_vocab_size": model.src_vocab_size,
         "tgt_vocab_size": model.tgt_vocab_size,
@@ -358,10 +358,10 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler=None,
 ) -> int:
-    """
+    '''
     Restore model (and optionally optimizer/scheduler) state from disk.
     Returns the saved epoch number.
-    """
+    '''
     blob = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(blob["model_state_dict"])
     if optimizer is not None and blob.get("optimizer_state_dict") is not None:
@@ -371,9 +371,9 @@ def load_checkpoint(
     return int(blob.get("epoch", 0))
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  EXPERIMENT ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
     # Architecture
@@ -417,19 +417,19 @@ DEFAULT_CONFIG = {
 
 
 def run_training_experiment(config: dict | None = None) -> dict:
-    """
+    '''
     Single entrypoint for all 5 ablation runs.
 
     The 'config' dict is merged on top of DEFAULT_CONFIG, so a run can be
     fully specified by overriding only the keys that differ from main.
 
     Returns the final dict from the best epoch (by val BLEU).
-    """
+    '''
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
     torch.manual_seed(cfg["seed"])
 
-    # ── W&B (optional) ──────────────────────────────────────────────
+    # -- W&B (optional) ----------------------------------------------
     wandb_run = None
     try:
         import wandb
@@ -444,7 +444,7 @@ def run_training_experiment(config: dict | None = None) -> dict:
     except Exception as e:
         print(f"[wandb] disabled: {e}")
 
-    # ── Data ────────────────────────────────────────────────────────
+    # -- Data --------------------------------------------------------
     from dataset import Multi30kDataset, Vocab, collate_batch
 
     train_ds = Multi30kDataset(split="train",      artifacts_dir=cfg["artifacts_dir"],
@@ -466,7 +466,7 @@ def run_training_experiment(config: dict | None = None) -> dict:
     test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"], shuffle=False,
                               collate_fn=lambda b: collate_batch(b, pad_idx=1), num_workers=0)
 
-    # ── Model ───────────────────────────────────────────────────────
+    # -- Model -------------------------------------------------------
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
     model = Transformer(
@@ -484,7 +484,7 @@ def run_training_experiment(config: dict | None = None) -> dict:
     if not cfg["use_scaling"]:
         _disable_attention_scaling(model)
 
-    # ── Optimization ────────────────────────────────────────────────
+    # -- Optimization ------------------------------------------------
     base_lr = 1.0 if cfg["scheduler"] == "noam" else cfg["fixed_lr"]
     optimizer = torch.optim.Adam(model.parameters(), lr=base_lr,
                                  betas=cfg["betas"], eps=cfg["eps"])
@@ -502,7 +502,7 @@ def run_training_experiment(config: dict | None = None) -> dict:
     raw_val_refs  = [val_ds._hf_split[i]["en"]  for i in range(len(val_ds))]
     raw_test_refs = [test_ds._hf_split[i]["en"] for i in range(len(test_ds))]
 
-    # ── Training loop ───────────────────────────────────────────────
+    # -- Training loop -----------------------------------------------
     best_bleu = -1.0
     best_epoch = -1
     no_improve_evals = 0
@@ -555,7 +555,7 @@ def run_training_experiment(config: dict | None = None) -> dict:
                           f"(no improvement for {no_improve_evals} evals)")
                     break
 
-    # ── Final test BLEU ─────────────────────────────────────────────
+    # -- Final test BLEU ---------------------------------------------
     load_checkpoint(cfg["checkpoint"], model)
     test_bleu = evaluate_bleu(model, test_loader, tgt_vocab, device=device,
                               max_len=cfg["max_len"], raw_references=raw_test_refs)
@@ -568,10 +568,10 @@ def run_training_experiment(config: dict | None = None) -> dict:
     return {"best_epoch": best_epoch, "best_val_bleu": best_bleu, "test_bleu": test_bleu, "history": history}
 
 
-# ── Ablation helpers ────────────────────────────────────────────────
+# -- Ablation helpers ------------------------------------------------
 
 class _LearnedPositionalEncoding(nn.Module):
-    """For section 2.4 ablation: learned positional embeddings."""
+    '''For section 2.4 ablation: learned positional embeddings.'''
     def __init__(self, d_model: int, max_len: int, dropout: float = 0.1):
         super().__init__()
         self.embed = nn.Embedding(max_len, d_model)
@@ -589,11 +589,11 @@ def _build_learned_pe(d_model: int, max_len: int, dropout: float) -> nn.Module:
 
 
 def _disable_attention_scaling(model: Transformer) -> None:
-    """
+    '''
     Monkey-patch scaled_dot_product_attention to remove 1/sqrt(d_k) scaling.
     Used for section 2.2 ablation. Applied PROCESS-WIDE so it persists for
     the whole run; restore by restarting the process.
-    """
+    '''
     import model as model_mod
 
     def no_scale_attn(Q, K, V, mask=None):

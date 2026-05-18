@@ -1,18 +1,18 @@
-"""
+'''
 model.py — Transformer Architecture Skeleton
 DA6401 Assignment 3: "Attention Is All You Need"
 
 AUTOGRADER CONTRACT (DO NOT MODIFY SIGNATURES):
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  scaled_dot_product_attention(Q, K, V, mask) → (out, weights)  │
-  │  MultiHeadAttention.forward(q, k, v, mask)   → Tensor          │
-  │  PositionalEncoding.forward(x)               → Tensor          │
-  │  make_src_mask(src, pad_idx)                 → BoolTensor      │
-  │  make_tgt_mask(tgt, pad_idx)                 → BoolTensor      │
-  │  Transformer.encode(src, src_mask)           → Tensor          │
-  │  Transformer.decode(memory,src_m,tgt,tgt_m)  → Tensor          │
-  └─────────────────────────────────────────────────────────────────┘
-"""
+  -----------------------------------------------------------------
+  |  scaled_dot_product_attention(Q, K, V, mask) returns (out, weights)  |
+  |  MultiHeadAttention.forward(q, k, v, mask)   returns Tensor          |
+  |  PositionalEncoding.forward(x)               returns Tensor          |
+  |  make_src_mask(src, pad_idx)                 returns BoolTensor      |
+  |  make_tgt_mask(tgt, pad_idx)                 returns BoolTensor      |
+  |  Transformer.encode(src, src_mask)           returns Tensor          |
+  |  Transformer.decode(memory,src_m,tgt,tgt_m)  returns Tensor          |
+  -----------------------------------------------------------------
+'''
 
 import math
 import copy
@@ -25,11 +25,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #   STANDALONE ATTENTION FUNCTION  
 #    Exposed at module level so the autograder can import and test it
 #    independently of MultiHeadAttention.
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 def scaled_dot_product_attention(
     Q: torch.Tensor,
@@ -37,7 +37,7 @@ def scaled_dot_product_attention(
     V: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
+    '''
     Scaled dot-product attention.
 
         Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
@@ -55,7 +55,7 @@ def scaled_dot_product_attention(
     Returns:
         output  : (..., seq_q, d_v)
         attn_w  : (..., seq_q, seq_k)  post-softmax weights
-    """
+    '''
     d_k = Q.size(-1)
     scale = d_k ** -0.5
 
@@ -68,22 +68,22 @@ def scaled_dot_product_attention(
     return output, alpha
 
 
-# ══════════════════════════════════════════════════════════════════════
-# ❷  MASK HELPERS 
+# ----------------------------------------------------------------------
+# MASK HELPERS 
 #    Exposed at module level so they can be tested independently and
 #    reused inside Transformer.forward.
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 def make_src_mask(
     src: torch.Tensor,
     pad_idx: int = 1,
 ) -> torch.Tensor:
-    """
+    '''
     Encoder padding mask. True at <pad> positions, False elsewhere.
 
     Shape: [B, 1, 1, src_len] broadcasts over heads and queries
     so one mask covers all (head, query) attention rows.
-    """
+    '''
     return (src == pad_idx).unsqueeze(1).unsqueeze(2)
 
 
@@ -91,12 +91,12 @@ def make_tgt_mask(
     tgt: torch.Tensor,
     pad_idx: int = 1,
 ) -> torch.Tensor:
-    """
+    '''
     Decoder mask = padding mask OR causal (look-ahead) mask.
 
     True at positions to mask out (PAD or future tokens).
     Shape: [B, 1, tgt_len, tgt_len].
-    """
+    '''
     B, L = tgt.shape
 
     pad_mask = (tgt == pad_idx).view(B, 1, 1, L)
@@ -107,12 +107,12 @@ def make_tgt_mask(
     return pad_mask | causal
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  MULTI-HEAD ATTENTION 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 class MultiHeadAttention(nn.Module):
-    """
+    '''
     Multi-Head Attention (Vaswani et al. 2017, Section 3.2.2).
 
         MultiHead(Q, K, V) = Concat(head_1, ..., head_h) @ W_O
@@ -127,7 +127,7 @@ class MultiHeadAttention(nn.Module):
       - The 1/sqrt(d_k) scale is delegated to scaled_dot_product_attention.
 
     nn.MultiheadAttention is NOT used.
-    """
+    '''
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -156,7 +156,7 @@ class MultiHeadAttention(nn.Module):
         value: torch.Tensor,
         mask:  Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
+        '''
         Self-attention is the case query is key is value.
         Cross-attention passes encoder memory as key and value.
 
@@ -169,7 +169,7 @@ class MultiHeadAttention(nn.Module):
 
         Returns:
             [B, seq_q, d_model]
-        """
+        '''
         if query is key and key is value:
             qkv = self.qkv(query)
             q, k, v = qkv.chunk(3, dim=-1)
@@ -192,12 +192,12 @@ class MultiHeadAttention(nn.Module):
         return self.out_proj(merged)
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #   POSITIONAL ENCODING  
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 class PositionalEncoding(nn.Module):
-    """
+    '''
     Sinusoidal positional encoding (Vaswani et al. 2017, Section 3.5).
 
     Even dims carry sine, odd dims carry cosine, with geometrically
@@ -205,7 +205,7 @@ class PositionalEncoding(nn.Module):
     (period 2*pi*10000). The table is precomputed once at init and
     stored as a non-persistent buffer -- it is deterministic, so there
     is no reason to bloat checkpoints with ~10 MB of constants.
-    """
+    '''
 
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
         super().__init__()
@@ -241,19 +241,19 @@ class PositionalEncoding(nn.Module):
         return self.drop(x + self.pe[:, :L])
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  FEED-FORWARD NETWORK 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 class PositionwiseFeedForward(nn.Module):
-    """
+    '''
     Position-wise feed-forward network (Vaswani et al. 2017, Section 3.3).
 
         FFN(x) = max(0, x W1 + b1) W2 + b2
 
     Two-layer MLP applied independently and identically to each position.
     Dropout is applied after the ReLU activation (paper Section 5.4).
-    """
+    '''
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -263,16 +263,16 @@ class PositionwiseFeedForward(nn.Module):
         self.drop    = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # [B, L, d_model] -> [B, L, d_ff] -> [B, L, d_model]
+        # [B, L, d_model] to [B, L, d_ff] to [B, L, d_model]
         return self.linear2(self.drop(self.act(self.linear1(x))))
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  ENCODER LAYER  
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 class EncoderLayer(nn.Module):
-    """
+    '''
     One encoder block with PRE-LayerNorm ordering:
 
         x = x + drop(self_attn(norm1(x)))
@@ -286,7 +286,7 @@ class EncoderLayer(nn.Module):
          the Transformer Architecture").
       3. It is the current standard in production transformers (GPT,
          LLaMA, T5-1.1, etc.).
-    """
+    '''
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -297,7 +297,7 @@ class EncoderLayer(nn.Module):
         self.drop      = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
-        # Sub-layer 1: self-attention with Post-LN residual (paper-standard)
+        # Sub-layer 1: self-attention with Post-LN residual
         x = self.norm1(x + self.drop(self.self_attn(x, x, x, mask=src_mask)))
 
         # Sub-layer 2: feed-forward with Post-LN residual
@@ -305,12 +305,12 @@ class EncoderLayer(nn.Module):
         return x
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #   DECODER LAYER 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 class DecoderLayer(nn.Module):
-    """
+    '''
     One decoder block with PRE-LayerNorm ordering:
 
         x = x + drop(masked_self_attn(norm1(x)))
@@ -318,7 +318,7 @@ class DecoderLayer(nn.Module):
         x = x + drop(ffn(norm3(x)))
 
     See EncoderLayer docstring for the Pre-LN justification.
-    """
+    '''
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
@@ -348,12 +348,12 @@ class DecoderLayer(nn.Module):
         return x
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #  ENCODER & DECODER STACKS
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 class Encoder(nn.Module):
-    """
+    '''
     Stack of N identical EncoderLayer modules with a final LayerNorm.
 
     The final norm is necessary under Pre-LN: without it, the very last
@@ -362,7 +362,7 @@ class Encoder(nn.Module):
 
     Layers are constructed fresh (no copy.deepcopy) so each has its own
     initialised parameters and there is no shared-state confusion.
-    """
+    '''
 
     def __init__(self, layer: EncoderLayer, N: int) -> None:
         super().__init__()
@@ -384,10 +384,10 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 class Decoder(nn.Module):
-    """
+    '''
     Stack of N identical DecoderLayer modules with a final LayerNorm.
     Same Pre-LN motivation as Encoder.
-    """
+    '''
 
     def __init__(self, layer: DecoderLayer, N: int) -> None:
         super().__init__()
@@ -414,12 +414,12 @@ class Decoder(nn.Module):
         return self.norm(x)
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 #   FULL TRANSFORMER  
-# ══════════════════════════════════════════════════════════════════════
+# ----------------------------------------------------------------------
 
 class Transformer(nn.Module):
-    """
+    '''
     Full encoder-decoder Transformer for sequence-to-sequence translation.
 
     Self-bootstrapping: a bare ``Transformer()`` call loads vocabularies,
@@ -436,9 +436,9 @@ class Transformer(nn.Module):
     Defaults for vocab sizes match the Multi30k vocab built from train split
     with min_freq=2: de=8012, en=6190. These are baked in so the autograder
     can call ``Transformer()`` with no arguments and get the right architecture.
-    """
+    '''
 
-    # ── Checkpoint plumbing ──────────────────────────────────────────
+    # -- Checkpoint plumbing ------------------------------------------
     # When CHECKPOINT_GDRIVE_ID is non-None, __init__ will download the
     # corresponding .pt file from Google Drive via gdown and load weights.
     # Set this AFTER the first successful Kaggle training run that produces
@@ -466,7 +466,7 @@ class Transformer(nn.Module):
         self.max_len        = max_len
         self.artifacts_dir  = artifacts_dir
 
-        # ── Architecture ─────────────────────────────────────────────
+        # -- Architecture ---------------------------------------------
         self.src_embed = nn.Embedding(src_vocab_size, d_model, padding_idx=1)
         self.tgt_embed = nn.Embedding(tgt_vocab_size, d_model, padding_idx=1)
         self.pos_enc   = PositionalEncoding(d_model, dropout=dropout, max_len=max_len)
@@ -482,7 +482,7 @@ class Transformer(nn.Module):
 
         self._init_weights()
 
-        # ── Vocab + tokenizer auto-load ──────────────────────────────
+        # -- Vocab + tokenizer auto-load ------------------------------
         # Per the announcement: vocab and tokenizers must load in __init__.
         # Failure here is NON-FATAL during unit tests where artifacts may
         # be absent; only infer() will then raise.
@@ -492,17 +492,17 @@ class Transformer(nn.Module):
         self.tgt_tokenizer = None
         self._load_vocab_and_tokenizers(artifacts_dir)
 
-        # ── Optional weight download + load ──────────────────────────
+        # -- Optional weight download + load --------------------------
         # checkpoint_path argument lets callers force a specific path;
         # otherwise we fall back to CHECKPOINT_GDRIVE_ID + CHECKPOINT_LOCAL_NAME.
         target_path = checkpoint_path or self.CHECKPOINT_LOCAL_NAME
         if self.CHECKPOINT_GDRIVE_ID is not None or checkpoint_path is not None:
             self._maybe_download_and_load_weights(target_path)
 
-    # ── Bootstrapping helpers ────────────────────────────────────────
+    # -- Bootstrapping helpers ----------------------------------------
 
     def _load_vocab_and_tokenizers(self, artifacts_dir: str) -> None:
-        """
+        '''
         Load vocabs from artifacts/ and spaCy tokenizers eagerly.
 
         If a spaCy model is missing, attempt a runtime install via
@@ -512,7 +512,7 @@ class Transformer(nn.Module):
 
         Imports are local so unit tests of pure-architecture code do not
         require the dataset module / spaCy to be importable.
-        """
+        '''
         try:
             from pathlib import Path as _P
             from dataset import Vocab, _make_spacy_tokenizer
@@ -532,10 +532,10 @@ class Transformer(nn.Module):
 
     @staticmethod
     def _safe_load_spacy(model_name: str):
-        """
+        '''
         Return a callable str->list[str] tokenizer for the given spaCy model.
         If the model is not installed, run ``python -m spacy download`` first.
-        """
+        '''
         import sys, subprocess, spacy
         from dataset import _make_spacy_tokenizer
         try:
@@ -552,7 +552,7 @@ class Transformer(nn.Module):
             return _make_spacy_tokenizer(model_name)
 
     def _maybe_download_and_load_weights(self, path: str) -> None:
-        """Download via gdown if not present, then load_state_dict."""
+        '''Download via gdown if not present, then load_state_dict.'''
         import os
         if not os.path.exists(path):
             if self.CHECKPOINT_GDRIVE_ID is None:
@@ -571,7 +571,7 @@ class Transformer(nn.Module):
                 )
 
     def _init_weights(self) -> None:
-        """Xavier-uniform on Linear; Normal(0, d^-0.5) on Embeddings."""
+        '''Xavier-uniform on Linear; Normal(0, d^-0.5) on Embeddings.'''
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 if module is self.generator:
@@ -585,7 +585,7 @@ class Transformer(nn.Module):
                     with torch.no_grad():
                         module.weight[module.padding_idx].zero_()
 
-    # ── AUTOGRADER HOOKS ── keep these signatures exactly ─────────────
+    # -- AUTOGRADER HOOKS -- keep these signatures exactly -------------
 
     def encode(
         self,
@@ -619,7 +619,7 @@ class Transformer(nn.Module):
         return self.decode(memory, src_mask, tgt, tgt_mask)
 
     def infer(self, src_sentence: str) -> str:
-        """
+        '''
         Translate a single German sentence to English via greedy decoding.
 
         End-to-end pipeline:
@@ -630,7 +630,7 @@ class Transformer(nn.Module):
           5. Strip specials and join tokens with spaces.
 
         Returns the English translation as a plain string.
-        """
+        '''
         if self.src_vocab is None or self.tgt_vocab is None:
             raise RuntimeError(
                 "Vocab not loaded. Ensure artifacts/vocab_de.pt and vocab_en.pt exist."
@@ -667,21 +667,18 @@ class Transformer(nn.Module):
             device=str(device),
         )
 
-        # Strip specials and join with spaces. NOTE: do NOT detokenize:
-        # sacrebleu's default tokenizer treats "word ." and "word." identically,
-        # and the autograder appears to favour the space-separated form (matching
-        # how the model was trained).
+        # Strip specials, join tokens with spaces.
         out_ids = ys[0].tolist()
         en_tokens = self.tgt_vocab.decode(out_ids, strip_specials=True)
         return " ".join(en_tokens)
 
     @staticmethod
     def _detokenize(text: str) -> str:
-        """
+        '''
         Collapse whitespace introduced by space-joining BPE-style tokens
         back into natural English punctuation. Matches the convention
         sacrebleu\'s default tokenizer expects on reference strings.
-        """
+        '''
         import re as _re
         # Remove space BEFORE: . , ! ? ; : %  and closing brackets ) ] }
         text = _re.sub(r"\s+([.,!?;:%)\]\}])", r"\1", text)
