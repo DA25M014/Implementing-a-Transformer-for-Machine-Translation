@@ -42,3 +42,6 @@ artifacts/*
 !artifacts/expanded_test.parquet
 backups/
 tools/
+generate_report.py
+generate_report.py.bak
+report_output.txt
