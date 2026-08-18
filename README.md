@@ -1,4 +1,4 @@
-# DA6401 - Assignment 3
+# Implementing a Transformer for Machine Translation
 
 ## Transformer for German-English Machine Translation
 > **Roll No:** DA25M014 · **Course:** DA6401 Deep Learning · **IIT Madras**
