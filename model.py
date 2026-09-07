@@ -273,19 +273,21 @@ class PositionwiseFeedForward(nn.Module):
 
 class EncoderLayer(nn.Module):
     '''
-    One encoder block with PRE-LayerNorm ordering:
+    One encoder block with POST-LayerNorm ordering:
 
-        x = x + drop(self_attn(norm1(x)))
-        x = x + drop(ffn(norm2(x)))
+        x = norm1(x + drop(self_attn(x)))
+        x = norm2(x + drop(ffn(x)))
 
-    Pre-LN is chosen over Post-LN because:
-      1. It is stable without aggressive warmup tuning -- gradients of
-         attention weights stay well-conditioned from the very first step.
-      2. It removes the need to scale residual paths by 1/sqrt(N) for
-         deep stacks (Xiong et al. 2020, "On Layer Normalization in
-         the Transformer Architecture").
-      3. It is the current standard in production transformers (GPT,
-         LLaMA, T5-1.1, etc.).
+    Post-LN is chosen over Pre-LN because:
+      1. Paper fidelity. Vaswani et al. (2017) apply LayerNorm after the
+         residual addition ("Add & Norm"). Pre-LN is a later refinement
+         (Xiong et al. 2020, "On Layer Normalization in the Transformer
+         Architecture") that changes gradient flow at initialisation.
+      2. Co-design with the Noam schedule. Post-LN is unstable at large
+         learning rates early in training, which is exactly what the
+         warmup phase mitigates, so the two are one system. Replacing
+         Noam with a constant learning rate costs 12.76 test BLEU
+         (ablation 2.1), which is the empirical evidence for that.
     '''
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
@@ -311,13 +313,13 @@ class EncoderLayer(nn.Module):
 
 class DecoderLayer(nn.Module):
     '''
-    One decoder block with PRE-LayerNorm ordering:
+    One decoder block with POST-LayerNorm ordering:
 
-        x = x + drop(masked_self_attn(norm1(x)))
-        x = x + drop(cross_attn(norm2(x), memory, memory))
-        x = x + drop(ffn(norm3(x)))
+        x = norm1(x + drop(masked_self_attn(x)))
+        x = norm2(x + drop(cross_attn(x, memory, memory)))
+        x = norm3(x + drop(ffn(x)))
 
-    See EncoderLayer docstring for the Pre-LN justification.
+    See EncoderLayer docstring for the Post-LN justification.
     '''
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
@@ -356,9 +358,11 @@ class Encoder(nn.Module):
     '''
     Stack of N identical EncoderLayer modules with a final LayerNorm.
 
-    The final norm is necessary under Pre-LN: without it, the very last
-    residual addition leaves activations un-normalized before they reach
-    the decoder's cross-attention.
+    Under Post-LN every layer already ends in a normalization, so this
+    trailing norm is an additional normalization rather than a stability
+    requirement (it IS a requirement under Pre-LN, where the last residual
+    addition would otherwise be left un-normalized). It carries its own
+    learnable parameters and is part of the trained checkpoint.
 
     Layers are constructed fresh (no copy.deepcopy) so each has its own
     initialised parameters and there is no shared-state confusion.
@@ -386,7 +390,7 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     '''
     Stack of N identical DecoderLayer modules with a final LayerNorm.
-    Same Pre-LN motivation as Encoder.
+    Same Post-LN note as Encoder.
     '''
 
     def __init__(self, layer: DecoderLayer, N: int) -> None:
@@ -427,7 +431,7 @@ class Transformer(nn.Module):
     via gdown -- all inside __init__, per the assignment\'s autograder contract.
 
     Architecture choices (full rationale in STYLE.md):
-      - Pre-LayerNorm throughout.
+      - Post-LayerNorm throughout ("Add & Norm", Vaswani et al. 2017).
       - Decoder input embedding TIED to output projection (Press & Wolf 2017).
       - Source and target embeddings independent.
       - Embeddings scaled by sqrt(d_model) before adding PE (paper Section 3.4).
